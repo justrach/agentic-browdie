@@ -37,6 +37,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+
+    // merjs E2E test binary
+    const merjs_e2e = b.addExecutable(.{
+        .name = "merjs-e2e",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test/merjs_e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(merjs_e2e);
+    const run_merjs_e2e = b.addRunArtifact(merjs_e2e);
+    const merjs_e2e_step = b.step("merjs-e2e", "Run merjs E2E tests (requires merjs + browdie + Chrome live)");
+    merjs_e2e_step.dependOn(&run_merjs_e2e.step);
+
     // Benchmarks
     const bench = b.addExecutable(.{
         .name = "browdie-bench",
