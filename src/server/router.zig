@@ -224,6 +224,8 @@ fn route(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *B
         handleFrames(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/network")) {
         handleNetwork(request, arena, bridge);
+    } else if (std.mem.eql(u8, clean_path, "/perf/lcp")) {
+        handlePerfLcp(request, arena, bridge);
     } else {
         resp.sendError(request, 404, "Not Found");
     }
@@ -2966,6 +2968,61 @@ fn handleNetwork(request: *std.http.Server.Request, arena: std.mem.Allocator, br
     resp.sendJson(request, body);
 }
 
+fn handlePerfLcp(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge) void {
+    const target = request.head.target;
+    const tab_id = getQueryParam(target, "tab_id") orelse {
+        resp.sendError(request, 400, "Missing tab_id parameter");
+        return;
+    };
+    const url = getQueryParam(target, "url");
+
+    const client = bridge.getCdpClient(tab_id) orelse {
+        resp.sendError(request, 404, "Tab not found");
+        return;
+    };
+
+    // If url is provided, navigate first and wait for page load
+    if (url) |nav_url| {
+        _ = client.send(arena, protocol.Methods.page_enable, null) catch {};
+        const nav_params = std.fmt.allocPrint(arena, "{{\"url\":\"{s}\"}}", .{nav_url}) catch {
+            resp.sendError(request, 500, "Internal Server Error");
+            return;
+        };
+        _ = client.send(arena, protocol.Methods.page_navigate, nav_params) catch {
+            resp.sendError(request, 502, "Navigation failed");
+            return;
+        };
+        _ = client.waitForEvent(arena, "Page.loadEventFired", 50);
+    }
+
+    const lcp_js =
+        "new Promise((resolve) => { " ++
+        "const entries = performance.getEntriesByType('largest-contentful-paint'); " ++
+        "if (entries.length > 0) { " ++
+        "const lcp = entries[entries.length - 1]; " ++
+        "resolve(JSON.stringify({lcp_ms: lcp.startTime, element: lcp.element ? lcp.element.tagName : null, url: lcp.url || null, size: lcp.size})); " ++
+        "} else { " ++
+        "new PerformanceObserver((list) => { " ++
+        "const entries = list.getEntries(); " ++
+        "const lcp = entries[entries.length - 1]; " ++
+        "resolve(JSON.stringify({lcp_ms: lcp.startTime, element: lcp.element ? lcp.element.tagName : null, url: lcp.url || null, size: lcp.size})); " ++
+        "}).observe({type: 'largest-contentful-paint', buffered: true}); " ++
+        "setTimeout(() => resolve(JSON.stringify({lcp_ms: null, error: 'timeout'})), 10000); " ++
+        "}})";
+
+    const params = std.fmt.allocPrint(arena,
+        "{{\"expression\":\"{s}\",\"awaitPromise\":true,\"returnByValue\":true}}", .{lcp_js}) catch {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
+
+    const response = client.send(arena, protocol.Methods.runtime_evaluate, params) catch {
+        resp.sendError(request, 502, "CDP command failed");
+        return;
+    };
+    resp.sendJson(request, response);
+}
+
 test "screenshot routes match" {
     for ([_][]const u8{ "/screenshot/annotated", "/screenshot/diff", "/screencast/start", "/screencast/stop" }) |p| {
         try std.testing.expect(p.len > 0);
@@ -3227,8 +3284,9 @@ test "total endpoint count" {
         "/window/new", "/session/list",
         "/set/viewport", "/set/useragent",
         "/dom/attributes", "/frames", "/network",
+        "/perf/lcp",
     };
-    try std.testing.expectEqual(@as(usize, 75), routes.len);
+    try std.testing.expectEqual(@as(usize, 76), routes.len);
 }
 
 test "buildGetExpression title" {
@@ -3382,4 +3440,12 @@ test "dom/attributes route with selector" {
 test "network route parameters" {
     const target = "/network?tab_id=t1&mode=disable";
     try std.testing.expectEqualStrings("disable", getQueryParam(target, "mode").?);
+}
+
+test "perf/lcp route parameters" {
+    const path = "/perf/lcp?tab_id=abc&url=https://example.com";
+    const clean = path[0..std.mem.indexOfScalar(u8, path, '?').?];
+    try std.testing.expectEqualStrings("/perf/lcp", clean);
+    try std.testing.expect(getQueryParam(path, "tab_id") != null);
+    try std.testing.expect(getQueryParam(path, "url") != null);
 }

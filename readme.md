@@ -34,6 +34,39 @@ kuri-browse    →  interactive terminal browser (navigate, follow links, search
 
 ---
 
+## 📦 Installation
+
+### Pre-built binaries
+
+Download the latest release for your platform from [GitHub Releases](https://github.com/justrach/kuri/releases/latest).
+
+```bash
+# macOS Apple Silicon
+curl -L https://github.com/justrach/kuri/releases/latest/download/kuri-$(curl -s https://api.github.com/repos/justrach/kuri/releases/latest | grep tag_name | cut -d '"' -f4)-aarch64-macos.tar.gz | tar xz
+
+# macOS Intel
+curl -L https://github.com/justrach/kuri/releases/latest/download/kuri-$(curl -s https://api.github.com/repos/justrach/kuri/releases/latest | grep tag_name | cut -d '"' -f4)-x86_64-macos.tar.gz | tar xz
+
+# Linux amd64
+curl -L https://github.com/justrach/kuri/releases/latest/download/kuri-$(curl -s https://api.github.com/repos/justrach/kuri/releases/latest | grep tag_name | cut -d '"' -f4)-x86_64-linux.tar.gz | tar xz
+
+# Linux arm64
+curl -L https://github.com/justrach/kuri/releases/latest/download/kuri-$(curl -s https://api.github.com/repos/justrach/kuri/releases/latest | grep tag_name | cut -d '"' -f4)-aarch64-linux.tar.gz | tar xz
+```
+
+### Build from source
+
+Requires [Zig ≥ 0.15.0](https://ziglang.org/download/).
+
+```bash
+git clone https://github.com/justrach/kuri.git
+cd kuri
+zig build -Doptimize=ReleaseFast
+# Binaries in zig-out/bin/: kuri, kuri-fetch, kuri-browse
+```
+
+---
+
 ## ⚡ Quick Start
 
 **Requirements:** [Zig ≥ 0.15.1](https://ziglang.org/download/) · Chrome/Chromium (for CDP mode)
