@@ -2,7 +2,7 @@ const std = @import("std");
 const markdown = @import("crawler/markdown.zig");
 
 const version = "0.1.0";
-const user_agent = "browdie-browse/" ++ version;
+const user_agent = "kuri-browse/" ++ version;
 
 pub fn main() !void {
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
@@ -14,7 +14,7 @@ pub fn main() !void {
 
     if (args.len > 1 and (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-V"))) {
         const stdout = std.fs.File.stdout();
-        stdout.writeAll("browdie-browse " ++ version ++ "\n") catch {};
+        stdout.writeAll("kuri-browse " ++ version ++ "\n") catch {};
         return;
     }
     if (args.len > 1 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))) {
@@ -25,9 +25,9 @@ pub fn main() !void {
     const color = shouldUseColor();
 
     if (color) {
-        std.debug.print("\x1b[1m🧁 browdie-browse\x1b[0m — terminal browser\n", .{});
+        std.debug.print("\x1b[1m🌰 kuri-browse\x1b[0m — terminal browser\n", .{});
     } else {
-        std.debug.print("browdie-browse — terminal browser\n", .{});
+        std.debug.print("kuri-browse — terminal browser\n", .{});
     }
 
     var browser = Browser.init(gpa, color);
@@ -702,7 +702,7 @@ fn printReplHelp(color: bool) void {
     _ = color;
     std.debug.print(
         \\
-        \\  🧁 browdie-browse commands
+        \\  🌰 kuri-browse commands
         \\
         \\  <number>          Follow link [N]
         \\  <url>             Navigate to URL (if contains '.')
@@ -723,11 +723,11 @@ fn printReplHelp(color: bool) void {
 fn printUsage() void {
     std.debug.print(
         \\
-        \\  browdie-browse 🧁 — interactive terminal browser
+        \\  kuri-browse 🌰 — interactive terminal browser
         \\
         \\  USAGE
-        \\    browdie-browse [url]       Open a URL and browse interactively
-        \\    browdie-browse             Start with no page (type :go <url>)
+        \\    kuri-browse [url]       Open a URL and browse interactively
+        \\    kuri-browse             Start with no page (type :go <url>)
         \\
         \\  OPTIONS
         \\    -V, --version              Print version and exit
