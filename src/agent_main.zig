@@ -5,7 +5,6 @@
 /// Session (~/.kuri/session.json) stores: cdp_url, refs (ref→backendNodeId map).
 /// Commands read/write the session so multiple invocations share state.
 ///
-/// Commands:
 ///   tabs [--port N]            list Chrome tabs (default port 9222)
 ///   use <ws_url>               attach to a tab (save to session)
 ///   go <url>                   navigate current tab
@@ -24,6 +23,10 @@
 ///   forward                    navigate forward
 ///   reload                     reload page
 ///   status                     show current session
+///   cookies                    list cookies with security flags
+///   headers                    check security response headers
+///   audit                      security audit (headers + cookies + HTTPS)
+
 
 const std = @import("std");
 const CdpClient = @import("cdp/client.zig").CdpClient;
@@ -36,16 +39,19 @@ const DEFAULT_CDP_PORT: u16 = 9222;
 const Session = struct {
     cdp_url: []const u8,
     refs: std.StringHashMap(u32),
+    extra_headers: std.StringHashMap([]const u8),
 
     fn init(allocator: std.mem.Allocator) Session {
         return .{
             .cdp_url = "",
             .refs = std.StringHashMap(u32).init(allocator),
+            .extra_headers = std.StringHashMap([]const u8).init(allocator),
         };
     }
 
     fn deinit(self: *Session) void {
         self.refs.deinit();
+        self.extra_headers.deinit();
     }
 };
 
@@ -90,6 +96,37 @@ pub fn main() !void {
     };
     defer session.deinit();
 
+    // Session-only commands (no CDP connection needed)
+    if (std.mem.eql(u8, cmd, "set-header")) {
+        if (rest.len < 2) fatal("set-header: requires <name> <value>\n", .{});
+        try session.extra_headers.put(try arena.dupe(u8, rest[0]), try arena.dupe(u8, rest[1]));
+        try saveSession(arena, &session);
+        const out = try std.fmt.allocPrint(arena, "{{\"ok\":true,\"header\":\"{s}\",\"value\":\"{s}\"}}\n", .{ rest[0], rest[1] });
+        std.fs.File.stdout().writeAll(out) catch {};
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "clear-headers")) {
+        session.extra_headers.clearRetainingCapacity();
+        try saveSession(arena, &session);
+        std.fs.File.stdout().writeAll("{\"ok\":true,\"cleared\":true}\n") catch {};
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "show-headers")) {
+        var hbuf: std.ArrayList(u8) = .empty;
+        const hw = hbuf.writer(arena);
+        hw.writeAll("{\"extra_headers\":{") catch {};
+        var hit = session.extra_headers.iterator();
+        var hfirst = true;
+        while (hit.next()) |entry| {
+            if (!hfirst) hw.writeAll(",") catch {};
+            hfirst = false;
+            hw.print("\"{s}\":\"{s}\"", .{ entry.key_ptr.*, entry.value_ptr.* }) catch {};
+        }
+        hw.writeAll("}}\n") catch {};
+        std.fs.File.stdout().writeAll(hbuf.items) catch {};
+        return;
+    }
+
     if (session.cdp_url.len == 0) {
         std.debug.print("error: no tab attached. Run `kuri-agent use <ws_url>`\n", .{});
         std.process.exit(1);
@@ -97,6 +134,11 @@ pub fn main() !void {
 
     var client = CdpClient.init(arena, session.cdp_url);
     defer client.deinit();
+
+    // Apply stored extra headers before any navigation
+    if (session.extra_headers.count() > 0) {
+        applyExtraHeaders(arena, &client, &session) catch {};
+    }
 
     if (std.mem.eql(u8, cmd, "go")) {
         if (rest.len < 1) fatal("go: requires <url>\n", .{});
@@ -135,13 +177,32 @@ pub fn main() !void {
         try cmdSimpleNav(arena, &client, "Page.goForward");
     } else if (std.mem.eql(u8, cmd, "reload")) {
         try cmdSimpleNav(arena, &client, protocol.Methods.page_reload);
+    } else if (std.mem.eql(u8, cmd, "cookies")) {
+        try cmdCookies(arena, &client);
+    } else if (std.mem.eql(u8, cmd, "headers")) {
+        try cmdHeaders(arena, &client);
+    } else if (std.mem.eql(u8, cmd, "audit")) {
+        try cmdAudit(arena, &client);
+    } else if (std.mem.eql(u8, cmd, "storage")) {
+        const which = if (rest.len > 0) rest[0] else "all";
+        try cmdStorage(arena, &client, which);
+    } else if (std.mem.eql(u8, cmd, "jwt")) {
+        try cmdJwt(arena, &client);
+    } else if (std.mem.eql(u8, cmd, "fetch")) {
+        if (rest.len < 2) fatal("fetch: requires <method> <url> [--data <json>]\n", .{});
+        const fdata = parseFetchData(rest[2..]);
+        try cmdFetch(arena, &client, rest[0], rest[1], fdata);
+    } else if (std.mem.eql(u8, cmd, "probe")) {
+        if (rest.len < 3) fatal("probe: requires <url-template> <start> <end>\n", .{});
+        const start_id = std.fmt.parseInt(u32, rest[1], 10) catch fatal("probe: start must be integer\n", .{});
+        const end_id = std.fmt.parseInt(u32, rest[2], 10) catch fatal("probe: end must be integer\n", .{});
+        try cmdProbe(arena, &client, rest[0], start_id, end_id);
     } else {
         std.debug.print("error: unknown command '{s}'\n", .{cmd});
         printUsage();
         std.process.exit(1);
     }
 }
-
 // ── Commands ─────────────────────────────────────────────────────────────────
 
 fn cmdTabs(arena: std.mem.Allocator, port: u16) !void {
@@ -437,6 +498,253 @@ fn cmdSimpleNav(arena: std.mem.Allocator, client: *CdpClient, method: []const u8
     std.fs.File.stdout().writeAll("\n") catch {};
 }
 
+// ── Security ──────────────────────────────────────────────────────────────────
+
+/// List all cookies with security flag annotations (Secure, HttpOnly, SameSite).
+fn cmdCookies(arena: std.mem.Allocator, client: *CdpClient) !void {
+    const response = client.send(arena, protocol.Methods.network_get_cookies, null) catch |err| {
+        std.debug.print("error: Network.getCookies failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const stdout = std.fs.File.stdout();
+    const cookies_pos = std.mem.indexOf(u8, response, "\"cookies\"") orelse {
+        stdout.writeAll(response) catch {};
+        stdout.writeAll("\n") catch {};
+        return;
+    };
+    const arr_start = std.mem.indexOfScalarPos(u8, response, cookies_pos, '[') orelse {
+        stdout.writeAll("{\"cookies\":[]}\n") catch {};
+        return;
+    };
+    var pos = arr_start + 1;
+    var count: usize = 0;
+    var buf: std.ArrayList(u8) = .empty;
+    const w = buf.writer(arena);
+    while (pos < response.len) {
+        const obj_start = std.mem.indexOfScalarPos(u8, response, pos, '{') orelse break;
+        var depth: usize = 1;
+        var i = obj_start + 1;
+        while (i < response.len and depth > 0) : (i += 1) {
+            if (response[i] == '{') depth += 1;
+            if (response[i] == '}') depth -= 1;
+        }
+        const cookie_json = response[obj_start..i];
+        const name = extractString(cookie_json, 0, "\"name\"") orelse "";
+        const domain = extractString(cookie_json, 0, "\"domain\"") orelse "";
+        const path_val = extractString(cookie_json, 0, "\"path\"") orelse "";
+        const same_site = extractString(cookie_json, 0, "\"sameSite\"") orelse "";
+        const http_only = std.mem.indexOf(u8, cookie_json, "\"httpOnly\":true") != null;
+        const secure = std.mem.indexOf(u8, cookie_json, "\"secure\":true") != null;
+        if (name.len > 0) {
+            count += 1;
+            w.print("  {s}  domain={s} path={s}", .{ name, domain, path_val }) catch {};
+            if (secure) w.writeAll("  [Secure]") catch {};
+            if (http_only) w.writeAll(" [HttpOnly]") catch {};
+            if (same_site.len > 0) w.print(" [SameSite={s}]", .{same_site}) catch {};
+            if (!secure) w.writeAll("  [!Secure]") catch {};
+            if (!http_only) w.writeAll(" [!HttpOnly]") catch {};
+            w.writeAll("\n") catch {};
+        }
+        pos = i + 1;
+    }
+    if (count == 0) {
+        stdout.writeAll("{\"cookies\":0}\n") catch {};
+    } else {
+        const hdr = try std.fmt.allocPrint(arena, "cookies ({d}):\n", .{count});
+        stdout.writeAll(hdr) catch {};
+        stdout.writeAll(buf.items) catch {};
+    }
+}
+
+/// Fetch security-relevant response headers for the current page via JS fetch HEAD.
+fn cmdHeaders(arena: std.mem.Allocator, client: *CdpClient) !void {
+    const js =
+        \\(async()=>{try{
+        \\const r=await fetch(location.href,{method:'HEAD',credentials:'include'});
+        \\const hs=['content-security-policy','strict-transport-security','x-frame-options',
+        \\ 'x-content-type-options','referrer-policy','permissions-policy',
+        \\ 'cross-origin-opener-policy','cross-origin-embedder-policy','x-xss-protection'];
+        \\const out={url:location.href,status:r.status,headers:{}};
+        \\hs.forEach(h=>{const v=r.headers.get(h);out.headers[h]=v??'(missing)';});
+        \\return JSON.stringify(out);
+        \\}catch(e){return JSON.stringify({error:e.message});}})()
+    ;
+    const escaped = try escapeForJson(arena, js);
+    const params = try std.fmt.allocPrint(arena,
+        "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true}}", .{escaped});
+    const response = client.send(arena, protocol.Methods.runtime_evaluate, params) catch |err| {
+        std.debug.print("error: headers eval failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    std.fs.File.stdout().writeAll(response) catch {};
+    std.fs.File.stdout().writeAll("\n") catch {};
+}
+
+/// Security audit: HTTPS, missing security headers, JS-visible cookies.
+fn cmdAudit(arena: std.mem.Allocator, client: *CdpClient) !void {
+    const js =
+        \\(async()=>{
+        \\const issues=[];
+        \\const r={protocol:location.protocol,url:location.href,headers:{},issues:[]};
+        \\if(location.protocol!=='https:')issues.push('NOT_HTTPS');
+        \\try{
+        \\ const res=await fetch(location.href,{method:'HEAD',credentials:'include'});
+        \\ const req=['content-security-policy','strict-transport-security',
+        \\  'x-frame-options','x-content-type-options','referrer-policy'];
+        \\ req.forEach(h=>{
+        \\  const v=res.headers.get(h);r.headers[h]=v??null;
+        \\  if(!v)issues.push('MISSING:'+h);
+        \\ });
+        \\}catch(e){issues.push('FETCH_ERROR:'+e.message);}
+        \\r.js_visible_cookies=document.cookie?document.cookie.split(';').length:0;
+        \\if(r.js_visible_cookies>0)issues.push('COOKIES_EXPOSED_TO_JS:'+r.js_visible_cookies);
+        \\r.issues=issues;
+        \\r.score=Math.max(0,10-issues.length*2);
+        \\return JSON.stringify(r);
+        \\})()
+    ;
+    const escaped = try escapeForJson(arena, js);
+    const params = try std.fmt.allocPrint(arena,
+        "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true}}", .{escaped});
+    const response = client.send(arena, protocol.Methods.runtime_evaluate, params) catch |err| {
+        std.debug.print("error: audit eval failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    std.fs.File.stdout().writeAll(response) catch {};
+    std.fs.File.stdout().writeAll("\n") catch {};
+}
+
+/// Apply session's stored extra HTTP headers via CDP Network domain.
+fn applyExtraHeaders(arena: std.mem.Allocator, client: *CdpClient, session: *Session) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    const w = buf.writer(arena);
+    w.writeAll("{\"headers\":{") catch {};
+    var it = session.extra_headers.iterator();
+    var first = true;
+    while (it.next()) |entry| {
+        if (!first) w.writeAll(",") catch {};
+        first = false;
+        w.print("\"{s}\":\"{s}\"", .{ entry.key_ptr.*, entry.value_ptr.* }) catch {};
+    }
+    w.writeAll("}}") catch {};
+    _ = client.send(arena, protocol.Methods.network_set_extra_http_headers, buf.items) catch {};
+}
+
+/// Dump localStorage and/or sessionStorage contents.
+fn cmdStorage(arena: std.mem.Allocator, client: *CdpClient, which: []const u8) !void {
+    var js: std.ArrayList(u8) = .empty;
+    const jw = js.writer(arena);
+    jw.writeAll("(()=>{") catch {};
+    jw.writeAll("const r={};") catch {};
+    if (std.mem.eql(u8, which, "local") or std.mem.eql(u8, which, "all")) {
+        jw.writeAll("r.localStorage=Object.fromEntries(Object.entries(localStorage));") catch {};
+    }
+    if (std.mem.eql(u8, which, "session") or std.mem.eql(u8, which, "all")) {
+        jw.writeAll("r.sessionStorage=Object.fromEntries(Object.entries(sessionStorage));") catch {};
+    }
+    jw.writeAll("return JSON.stringify(r);") catch {};
+    jw.writeAll("})()") catch {};
+    const escaped = try escapeForJson(arena, js.items);
+    const params = try std.fmt.allocPrint(arena,
+        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{escaped});
+    const response = client.send(arena, protocol.Methods.runtime_evaluate, params) catch |err| {
+        std.debug.print("error: storage eval failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    std.fs.File.stdout().writeAll(response) catch {};
+    std.fs.File.stdout().writeAll("\n") catch {};
+}
+
+/// Scan localStorage, sessionStorage, and cookies for JWT tokens, decode payloads.
+fn cmdJwt(arena: std.mem.Allocator, client: *CdpClient) !void {
+    const js =
+        \\(()=>{
+        \\const tokens=[];
+        \\const re=/eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g;
+        \\function decode(t){try{const p=t.split('.')[1];return JSON.parse(atob(p.replace(/-/g,'+').replace(/_/g,'/')));}catch(e){return null;}}
+        \\function scan(src,label){if(!src)return;const ms=src.match(re)||[];ms.forEach(t=>{tokens.push({source:label,token:t.substring(0,80)+'...',payload:decode(t)});});}
+        \\for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);scan(localStorage.getItem(k),'localStorage:'+k);}
+        \\for(let i=0;i<sessionStorage.length;i++){const k=sessionStorage.key(i);scan(sessionStorage.getItem(k),'sessionStorage:'+k);}
+        \\scan(document.cookie,'cookie');
+        \\return JSON.stringify({found:tokens.length,tokens});
+        \\})()
+    ;
+    const escaped = try escapeForJson(arena, js);
+    const params = try std.fmt.allocPrint(arena,
+        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{escaped});
+    const response = client.send(arena, protocol.Methods.runtime_evaluate, params) catch |err| {
+        std.debug.print("error: jwt scan failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    std.fs.File.stdout().writeAll(response) catch {};
+    std.fs.File.stdout().writeAll("\n") catch {};
+}
+
+/// Make an authenticated fetch() from browser context (uses current cookies + extra headers).
+fn cmdFetch(arena: std.mem.Allocator, client: *CdpClient, method: []const u8, url: []const u8, data: ?[]const u8) !void {
+    var js: std.ArrayList(u8) = .empty;
+    const jw = js.writer(arena);
+    jw.writeAll("(async()=>{") catch {};
+    jw.writeAll("const opts={credentials:'include',method:'") catch {};
+    jw.writeAll(method) catch {};
+    jw.writeAll("'};") catch {};
+    if (data) |d| {
+        jw.writeAll("opts.body=JSON.stringify(") catch {};
+        jw.writeAll(d) catch {};
+        jw.writeAll(");opts.headers={'Content-Type':'application/json'};") catch {};
+    }
+    jw.writeAll("const r=await fetch('") catch {};
+    jw.writeAll(url) catch {};
+    jw.writeAll("',opts);") catch {};
+    jw.writeAll("const body=await r.text();") catch {};
+    jw.writeAll("const hdrs={};r.headers.forEach((v,k)=>{hdrs[k]=v;});") catch {};
+    jw.writeAll("return JSON.stringify({status:r.status,url:r.url,headers:hdrs,body:body.substring(0,5000)});") catch {};
+    jw.writeAll("})()") catch {};
+    const escaped = try escapeForJson(arena, js.items);
+    const params = try std.fmt.allocPrint(arena,
+        "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true}}", .{escaped});
+    const response = client.send(arena, protocol.Methods.runtime_evaluate, params) catch |err| {
+        std.debug.print("error: fetch failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    std.fs.File.stdout().writeAll(response) catch {};
+    std.fs.File.stdout().writeAll("\n") catch {};
+}
+
+fn parseFetchData(flags: []const []const u8) ?[]const u8 {
+    for (flags, 0..) |f, i| {
+        if (std.mem.eql(u8, f, "--data") and i + 1 < flags.len) return flags[i + 1];
+    }
+    return null;
+}
+
+/// Enumerate a URL template by substituting {id} with a range — IDOR probe.
+fn cmdProbe(arena: std.mem.Allocator, client: *CdpClient, tmpl: []const u8, start_id: u32, end_id: u32) !void {
+    var js: std.ArrayList(u8) = .empty;
+    const jw = js.writer(arena);
+    jw.writeAll("(async()=>{") catch {};
+    jw.writeAll("const results=[];") catch {};
+    jw.print("const tmpl='{s}';", .{tmpl}) catch {};
+    jw.print("for(let id={d};id<={d};id++){{", .{ start_id, end_id }) catch {};
+    jw.writeAll("const url=tmpl.split('{id}').join(String(id));") catch {};
+    jw.writeAll("try{const r=await fetch(url,{credentials:'include'});") catch {};
+    jw.writeAll("results.push({id,url,status:r.status});}") catch {};
+    jw.writeAll("catch(e){results.push({id,url,error:e.message});}") catch {};
+    jw.writeAll("}") catch {};
+    jw.writeAll("return JSON.stringify(results);") catch {};
+    jw.writeAll("})()") catch {};
+    const escaped = try escapeForJson(arena, js.items);
+    const params = try std.fmt.allocPrint(arena,
+        "{{\"expression\":\"{s}\",\"returnByValue\":true,\"awaitPromise\":true}}", .{escaped});
+    const response = client.send(arena, protocol.Methods.runtime_evaluate, params) catch |err| {
+        std.debug.print("error: probe failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    std.fs.File.stdout().writeAll(response) catch {};
+    std.fs.File.stdout().writeAll("\n") catch {};
+}
+
+
 // ── Session I/O ───────────────────────────────────────────────────────────────
 
 fn sessionPath(arena: std.mem.Allocator) ![]const u8 {
@@ -483,6 +791,31 @@ fn loadSession(arena: std.mem.Allocator) !Session {
         }
     }
 
+    // Extract extra_headers object: "extra_headers":{"X-Auth":"value",...}
+    if (std.mem.indexOf(u8, data, "\"extra_headers\"")) |eh_pos| {
+        const eh_obj = std.mem.indexOfScalarPos(u8, data, eh_pos, '{') orelse return session;
+        var epos = eh_obj + 1;
+        while (epos < data.len) {
+            const eq1 = std.mem.indexOfScalarPos(u8, data, epos, '"') orelse break;
+            if (data[eq1 + 1] == '}' or eq1 + 1 >= data.len) break;
+            const eq2 = std.mem.indexOfScalarPos(u8, data, eq1 + 1, '"') orelse break;
+            const ekey = data[eq1 + 1 .. eq2];
+            if (ekey.len == 0) break;
+            const ecolon = std.mem.indexOfScalarPos(u8, data, eq2 + 1, ':') orelse break;
+            var evs = ecolon + 1;
+            while (evs < data.len and data[evs] == ' ') : (evs += 1) {}
+            if (evs >= data.len or data[evs] != '"') break;
+            evs += 1;
+            const eve = std.mem.indexOfScalarPos(u8, data, evs, '"') orelse break;
+            const owned_ekey = try arena.dupe(u8, ekey);
+            const owned_eval = try arena.dupe(u8, data[evs..eve]);
+            try session.extra_headers.put(owned_ekey, owned_eval);
+            epos = eve + 1;
+            if (epos < data.len and data[epos] == ',') epos += 1;
+            if (epos < data.len and data[epos] == '}') break;
+        }
+    }
+
     return session;
 }
 
@@ -507,6 +840,14 @@ fn saveSession(arena: std.mem.Allocator, session: *Session) !void {
         if (!first) w.writeAll(",") catch {};
         first = false;
         w.print("\"{s}\":{d}", .{ entry.key_ptr.*, entry.value_ptr.* }) catch {};
+    }
+    w.writeAll("},\"extra_headers\":{") catch {};
+    var eit = session.extra_headers.iterator();
+    var efirst = true;
+    while (eit.next()) |entry| {
+        if (!efirst) w.writeAll(",") catch {};
+        efirst = false;
+        w.print("\"{s}\":\"{s}\"", .{ entry.key_ptr.*, entry.value_ptr.* }) catch {};
     }
     w.writeAll("}}\n") catch {};
 
@@ -711,7 +1052,23 @@ fn printUsage() void {
         \\  focus <ref>                  focus element
         \\  scroll                       scroll down 500px
         \\
+        \\Security:
+        \\  cookies                      list cookies with Secure/HttpOnly/SameSite flags
+        \\  headers                      check security response headers (CSP, HSTS, etc.)
+        \\  audit                        full security audit: HTTPS, headers, JS-visible cookies
+        \\  storage [local|session|all]  dump localStorage / sessionStorage
+        \\  jwt                          scan storage+cookies for JWTs, decode payloads
+        \\  fetch <method> <url>         authenticated fetch (uses session cookies + headers)
+        \\    [--data <json>]            optional request body
+        \\  probe <url-template> <N> <M> IDOR probe: replace {{id}} with N..M, report status
+        \\
+        \\Auth headers (persisted in session):
+        \\  set-header <name> <value>    add/update a request header (e.g. Authorization)
+        \\  clear-headers                remove all stored extra headers
+        \\  show-headers                 print stored extra headers
+        \\
         \\Session stored at: ~/.kuri/session.json
         \\
+
     , .{});
 }
