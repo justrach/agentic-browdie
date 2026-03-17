@@ -18,6 +18,7 @@ CDP automation · A11y snapshots · HAR recording · Standalone fetcher · Inter
 
 [Quick Start](#-quick-start) · [API](#-http-api) · [kuri-agent](#-kuri-agent) · [kuri-fetch](#-kuri-fetch) · [kuri-browse](#-kuri-browse) · [Security Testing](#-security-testing) · [Architecture](#-architecture) · [Configuration](#-configuration)
 
+> **Why teams switch to Kuri:** 464 KB server binary, ~3 ms cold start, and on a live Google Flights page the default compact snapshot used **2,841 tokens** vs **4,591** for agent-browser.
 
 ---
 
@@ -31,8 +32,6 @@ kuri           →  CDP server (Chrome automation, a11y snapshots, HAR)
 kuri-fetch     →  standalone fetcher (no Chrome, QuickJS for JS, ~2 MB)
 kuri-browse    →  interactive terminal browser (navigate, follow links, search)
 kuri-agent     →  agentic CLI (scriptable Chrome automation + security testing)
-```
-
 ```
 
 ---
@@ -75,8 +74,8 @@ zig build -Doptimize=ReleaseFast
 **Requirements:** [Zig ≥ 0.15.1](https://ziglang.org/download/) · Chrome/Chromium (for CDP mode)
 
 ```bash
-git clone https://github.com/justrach/agentic-browdie.git
-cd agentic-browdie
+git clone https://github.com/justrach/kuri.git
+cd kuri
 
 zig build              # build everything
 zig build test         # run 230+ tests
@@ -117,6 +116,12 @@ curl -s "http://localhost:8080/snapshot?tab_id=ABC123&filter=interactive"
 
 Measured on Apple M3 Pro, macOS 15.3. `kuri` built with `-Doptimize=ReleaseFast`. `agent-browser` v0.20.0 (Rust native binary).
 
+### What matters to an agent
+
+- `kuri` is optimized for the thing agents pay for: low-token snapshots of real pages, not full DOM dumps.
+- The strongest story is not "we have more features"; it is "we return the right amount of state for the next model step."
+- On JS-heavy pages, a tiny output is only good if the page actually rendered. Empty-shell output is a failure mode, not a win.
+
 ### vs agent-browser (Rust)
 
 Both are native binaries — agent-browser is Rust, kuri is Zig. Measured with agent-browser v0.20.0.
@@ -138,6 +143,30 @@ HTTP API server         ❌ (CLI only)         ✅ kuri           thread-per-con
 > **Note:** agent-browser has significantly more browser automation commands (140+) including
 > drag-and-drop, file upload/download, iOS simulator support, auth vault, and video recording.
 > Kuri focuses on being a lightweight HTTP API server for AI agent integration.
+
+### Real page token benchmark: Google Flights `SIN → TYO`
+
+Same Chrome session, measured with `tiktoken` `cl100k_base`.
+
+| Tool / Mode | Bytes | Tokens | vs `kuri` default | Note |
+|---|---:|---:|---:|---|
+| `kuri snap` (compact, default) | 7,935 | 2,841 | 1.0x | Baseline |
+| `kuri snap --interactive` | 5,129 | 1,888 | 0.7x | Lowest useful output |
+| `kuri snap --semantic` | 7,935 | 2,841 | 1.0x | Same as default |
+| `kuri snap --all` | 67,018 | 29,303 | 10.3x | Full verbose tree |
+| `kuri snap --json` | 156,801 | 49,182 | 17.3x | Old default, too expensive |
+| `kuri snap --text` | 70,517 | 26,583 | 9.4x | Text-heavy dump |
+| `agent-browser snapshot` | 15,880 | 4,591 | 1.6x | More verbose on same page |
+| `agent-browser snapshot -i` | 7,226 | 2,499 | 0.9x | Close, still larger |
+| `lightpanda semantic_tree` | 68,084 | 26,433 | 9.3x | Raw DOM JSON, no useful compression |
+| `lightpanda semantic_tree_text` | 1,909 | 507 | 0.2x | JS-heavy SPA did not render flight data |
+
+**What this shows**
+
+- On the same live page, `kuri` default was **38% leaner** than `agent-browser` (`2,841` vs `4,591` tokens).
+- `kuri --interactive` stayed useful while dropping to **1,888 tokens**, a **25% reduction** vs `agent-browser snapshot -i`.
+- Lightpanda's smallest output looked efficient only because Google Flights did not render there; the page data was missing.
+- The new compact default matters: the previous JSON-shaped default was **17.3x** more expensive than the current one.
 
 ### vs Playwright / Lightpanda
 
@@ -569,8 +598,8 @@ For a 50-page monitoring task (from Pinchtab benchmarks):
 Open an issue before submitting a large PR so we can align on the approach.
 
 ```bash
-git clone https://github.com/justrach/agentic-browdie.git
-cd agentic-browdie
+git clone https://github.com/justrach/kuri.git
+cd kuri
 zig build test         # 230+ tests must pass
 zig build test-fetch   # kuri-fetch tests (66 tests)
 zig build test-browse  # kuri-browse tests
