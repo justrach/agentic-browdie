@@ -153,6 +153,8 @@ pub fn main() !void {
         try cmdAction(arena, &client, &session, "focus", rest[0], null);
     } else if (std.mem.eql(u8, cmd, "scroll")) {
         try cmdScroll(arena, &client);
+    } else if (std.mem.eql(u8, cmd, "viewport")) {
+        try cmdViewport(arena, &client, rest);
     } else if (std.mem.eql(u8, cmd, "eval")) {
         if (rest.len < 1) fatal("eval: requires <js>\n", .{});
         try cmdEval(arena, &client, rest[0]);
@@ -424,6 +426,60 @@ fn cmdScroll(arena: std.mem.Allocator, client: *CdpClient) !void {
     };
     std.fs.File.stdout().writeAll(response) catch {};
     std.fs.File.stdout().writeAll("\n") catch {};
+}
+
+fn cmdViewport(arena: std.mem.Allocator, client: *CdpClient, args: []const []const u8) !void {
+    // Presets: mobile (390x844), tablet (768x1024), desktop (1280x800)
+    // Custom:  viewport <width> <height> [--dpr N]
+    var width: u32 = 390;
+    var height: u32 = 844;
+    var dpr: u32 = 2;
+    var mobile: bool = true;
+
+    if (args.len > 0) {
+        const preset = args[0];
+        if (std.mem.eql(u8, preset, "mobile") or std.mem.eql(u8, preset, "m")) {
+            width = 390; height = 844; dpr = 2; mobile = true;
+        } else if (std.mem.eql(u8, preset, "tablet") or std.mem.eql(u8, preset, "t")) {
+            width = 768; height = 1024; dpr = 2; mobile = true;
+        } else if (std.mem.eql(u8, preset, "desktop") or std.mem.eql(u8, preset, "d")) {
+            width = 1280; height = 800; dpr = 1; mobile = false;
+        } else if (std.mem.eql(u8, preset, "reset")) {
+            width = 1280; height = 800; dpr = 1; mobile = false;
+        } else {
+            // numeric width — expect viewport <w> <h> [--dpr N]
+            width = std.fmt.parseInt(u32, preset, 10) catch {
+                std.debug.print("error: unknown viewport preset '{s}'. Use mobile/tablet/desktop or <width> <height>\n", .{preset});
+                std.process.exit(1);
+            };
+            height = if (args.len > 1) std.fmt.parseInt(u32, args[1], 10) catch 900 else 900;
+            dpr = 1;
+            mobile = width < 768;
+            // --dpr flag
+            var i: usize = 2;
+            while (i + 1 < args.len) : (i += 1) {
+                if (std.mem.eql(u8, args[i], "--dpr")) {
+                    dpr = std.fmt.parseInt(u32, args[i + 1], 10) catch dpr;
+                    break;
+                }
+            }
+        }
+    }
+
+    const params = try std.fmt.allocPrint(arena,
+        "{{\"width\":{d},\"height\":{d},\"deviceScaleFactor\":{d},\"mobile\":{s}}}",
+        .{ width, height, dpr, if (mobile) "true" else "false" });
+
+    const response = client.send(arena, protocol.Methods.emulation_set_device_metrics, params) catch |err| {
+        std.debug.print("error: viewport failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    _ = response;
+
+    const out = try std.fmt.allocPrint(arena,
+        "{{\"ok\":true,\"width\":{d},\"height\":{d},\"dpr\":{d},\"mobile\":{s}}}\n",
+        .{ width, height, dpr, if (mobile) "true" else "false" });
+    std.fs.File.stdout().writeAll(out) catch {};
 }
 
 fn cmdEval(arena: std.mem.Allocator, client: *CdpClient, expr: []const u8) !void {
@@ -1064,6 +1120,7 @@ fn printUsage() void {
         \\  hover <ref>                  hover over element
         \\  focus <ref>                  focus element
         \\  scroll                       scroll down 500px
+        \\  viewport mobile|tablet|desktop|<w> <h>  set viewport size
         \\
         \\Security:
         \\  cookies                      list cookies with Secure/HttpOnly/SameSite flags
