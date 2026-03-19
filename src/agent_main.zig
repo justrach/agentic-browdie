@@ -31,12 +31,14 @@ const Session = struct {
     cdp_url: []const u8,
     refs: std.StringHashMap(u32),
     extra_headers: std.StringHashMap([]const u8),
+    stealth: bool,
 
     fn init(allocator: std.mem.Allocator) Session {
         return .{
             .cdp_url = "",
             .refs = std.StringHashMap(u32).init(allocator),
             .extra_headers = std.StringHashMap([]const u8).init(allocator),
+            .stealth = false,
         };
     }
 
@@ -131,6 +133,11 @@ pub fn main() !void {
         applyExtraHeaders(arena, &client, &session) catch {};
     }
 
+    // Apply stealth patches if enabled in session
+    if (session.stealth) {
+        applyStealth(arena, &client) catch {};
+    }
+
     if (std.mem.eql(u8, cmd, "go")) {
         if (rest.len < 1) fatal("go: requires <url>\n", .{});
         try cmdNavigate(arena, &client, rest[0]);
@@ -198,7 +205,12 @@ pub fn main() !void {
         // Poll for a new tab to appear, auto-switch to it
         const port: u16 = parsePort(rest);
         try cmdWaitForTab(arena, port, &session);
+    } else if (std.mem.eql(u8, cmd, "stealth")) {
+        try cmdStealth(arena, &client);
     } else {
+        std.debug.print("error: unknown command '{s}'\n", .{cmd});
+        printUsage();
+        std.process.exit(1);
     }
 }
 // ── Commands ─────────────────────────────────────────────────────────────────
@@ -681,6 +693,54 @@ fn parsePort(args: []const []const u8) u16 {
     return 9222;
 }
 
+// ── Stealth ───────────────────────────────────────────────────────────────────
+/// Apply stealth patches (called on every CDP connection when session.stealth=true).
+fn applyStealth(arena: std.mem.Allocator, client: *CdpClient) !void {
+    const stealth = @import("cdp/stealth.zig");
+    const ua = stealth.randomUserAgent();
+    const ua_escaped = try escapeForJson(arena, ua);
+
+    // Network-level UA override
+    _ = client.send(arena, protocol.Methods.network_enable, null) catch {};
+    const net_params = try std.fmt.allocPrint(arena,
+        "{{\"userAgent\":\"{s}\"}}", .{ua_escaped});
+    _ = client.send(arena, "Network.setUserAgentOverride", net_params) catch {};
+
+    // Combined stealth script: override navigator.userAgent + stealth.js
+    const ua_js = try std.fmt.allocPrint(arena,
+        "Object.defineProperty(navigator,'userAgent',{{get:()=>'{s}',configurable:true}});", .{ua});
+    const combined = try std.fmt.allocPrint(arena,
+        "{s}\n{s}", .{ ua_js, stealth.stealth_script });
+    const escaped = try escapeForJson(arena, combined);
+
+    // Inject into current page
+    const eval_params = try std.fmt.allocPrint(arena,
+        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{escaped});
+    _ = client.send(arena, protocol.Methods.runtime_evaluate, eval_params) catch {};
+
+    // Persist across navigations within this session
+    const persist_params = try std.fmt.allocPrint(arena,
+        "{{\"source\":\"{s}\"}}", .{escaped});
+    _ = client.send(arena, "Page.addScriptToEvaluateOnNewDocument", persist_params) catch {};
+}
+
+/// Enable stealth mode: apply patches + save to session so every future command re-applies.
+fn cmdStealth(arena: std.mem.Allocator, client: *CdpClient) !void {
+    try applyStealth(arena, client);
+
+    // Save stealth=true to session
+    var session = loadSession(arena) catch Session.init(arena);
+    session.stealth = true;
+    try saveSession(arena, &session);
+
+    const stealth = @import("cdp/stealth.zig");
+    const ua = stealth.randomUserAgent();
+    const ua_escaped = try escapeForJson(arena, ua);
+    const out = try std.fmt.allocPrint(arena,
+        "{{\"ok\":true,\"ua\":\"{s}\",\"stealth\":true,\"persisted\":true}}\n", .{ua_escaped});
+    std.fs.File.stdout().writeAll(out) catch {};
+}
+
 // ── Security ──────────────────────────────────────────────────────────────────
 
 /// List all cookies with security flag annotations (Secure, HttpOnly, SameSite).
@@ -999,6 +1059,11 @@ fn loadSession(arena: std.mem.Allocator) !Session {
         }
     }
 
+    // Extract stealth flag
+    if (std.mem.indexOf(u8, data, "\"stealth\":true")) |_| {
+        session.stealth = true;
+    }
+
     return session;
 }
 
@@ -1032,7 +1097,7 @@ fn saveSession(arena: std.mem.Allocator, session: *Session) !void {
         efirst = false;
         w.print("\"{s}\":\"{s}\"", .{ entry.key_ptr.*, entry.value_ptr.* }) catch {};
     }
-    w.writeAll("}}\n") catch {};
+    w.print("}},\"stealth\":{s}}}\n", .{if (session.stealth) "true" else "false"}) catch {};
 
     const file = try std.fs.cwd().createFile(path, .{});
     defer file.close();
@@ -1244,6 +1309,7 @@ fn printUsage() void {
         \\  viewport mobile|tablet|desktop|<w> <h>  set viewport size
         \\  grab <ref>                   click + follow redirect in-tab (bypasses popups)
         \\  wait-for-tab [--port N]      poll for new tab, auto-switch to it
+        \\  stealth                      apply anti-bot patches (UA override + stealth.js)
         \\
         \\Security:
         \\  cookies                      list cookies with Secure/HttpOnly/SameSite flags
