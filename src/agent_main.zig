@@ -352,13 +352,14 @@ fn cmdStatus(arena: std.mem.Allocator) !void {
 }
 
 fn cmdNavigate(arena: std.mem.Allocator, client: *CdpClient, url: []const u8) !void {
-    const params = try std.fmt.allocPrint(arena, "{{\"url\":\"{s}\"}}", .{url});
-    const response = client.send(arena, protocol.Methods.page_navigate, params) catch |err| {
-        std.debug.print("error: CDP navigate failed: {s}\n", .{@errorName(err)});
+    const escaped_url = try escapeForJson(arena, url);
+    const params = try std.fmt.allocPrint(arena, "{{\"url\":\"{s}\"}}", .{escaped_url});
+    _ = client.send(arena, protocol.Methods.page_navigate, params) catch |err| {
+        std.debug.print("error: navigate failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    std.fs.File.stdout().writeAll(response) catch {};
-    std.fs.File.stdout().writeAll("\n") catch {};
+    const out = try std.fmt.allocPrint(arena, "{{\"ok\":true,\"url\":\"{s}\"}}\n", .{escaped_url});
+    std.fs.File.stdout().writeAll(out) catch {};
 }
 
 fn cmdSnap(arena: std.mem.Allocator, client: *CdpClient, session: *Session, flags: []const []const u8) !void {
@@ -505,8 +506,9 @@ fn cmdAction(arena: std.mem.Allocator, client: *CdpClient, session: *Session, ac
         std.debug.print("error: Runtime.callFunctionOn failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    std.fs.File.stdout().writeAll(response) catch {};
-    std.fs.File.stdout().writeAll("\n") catch {};
+    const val = extractCdpValue(response);
+    const out = try std.fmt.allocPrint(arena, "{{\"ok\":true,\"action\":\"{s}\"}}\n", .{val});
+    std.fs.File.stdout().writeAll(out) catch {};
 }
 
 fn cmdScroll(arena: std.mem.Allocator, client: *CdpClient) !void {
@@ -515,8 +517,8 @@ fn cmdScroll(arena: std.mem.Allocator, client: *CdpClient) !void {
         std.debug.print("error: scroll failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    std.fs.File.stdout().writeAll(response) catch {};
-    std.fs.File.stdout().writeAll("\n") catch {};
+    _ = response;
+    std.fs.File.stdout().writeAll("{\"ok\":true}\n") catch {};
 }
 
 fn cmdViewport(arena: std.mem.Allocator, client: *CdpClient, args: []const []const u8) !void {
@@ -580,7 +582,8 @@ fn cmdEval(arena: std.mem.Allocator, client: *CdpClient, expr: []const u8) !void
         std.debug.print("error: eval failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    std.fs.File.stdout().writeAll(response) catch {};
+    const val = unescapeJson(arena, extractCdpValue(response));
+    std.fs.File.stdout().writeAll(val) catch {};
     std.fs.File.stdout().writeAll("\n") catch {};
 }
 
@@ -594,7 +597,8 @@ fn cmdText(arena: std.mem.Allocator, client: *CdpClient, selector: ?[]const u8) 
         std.debug.print("error: text failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    std.fs.File.stdout().writeAll(response) catch {};
+    const val = unescapeJson(arena, extractCdpValue(response));
+    std.fs.File.stdout().writeAll(val) catch {};
     std.fs.File.stdout().writeAll("\n") catch {};
 }
 
@@ -647,8 +651,8 @@ fn cmdSimpleNav(arena: std.mem.Allocator, client: *CdpClient, method: []const u8
         std.debug.print("error: {s} failed: {s}\n", .{ method, @errorName(err) });
         std.process.exit(1);
     };
-    std.fs.File.stdout().writeAll(response) catch {};
-    std.fs.File.stdout().writeAll("\n") catch {};
+    _ = response;
+    std.fs.File.stdout().writeAll("{\"ok\":true}\n") catch {};
 }
 
 // ── Tab following ─────────────────────────────────────────────────────────────
@@ -1220,6 +1224,28 @@ fn fetchChromeTabs(arena: std.mem.Allocator, host: []const u8, port: u16) ![]con
 
 /// Extract a JSON string value for a given field key, starting at `start`.
 /// Returns the content between the quotes after the field's colon.
+
+/// Extract the value from a CDP Runtime.evaluate / callFunctionOn response.
+/// Handles: {"id":N,"result":{"result":{"type":"string","value":"..."}}}
+/// Returns the raw value string, or the full response if not parseable.
+fn extractCdpValue(resp: []const u8) []const u8 {
+    // Check for error first
+    if (std.mem.indexOf(u8, resp, "\"exceptionDetails\"")) |_| return resp;
+    // Find "value": and extract
+    const marker = "\"value\":";
+    const pos = std.mem.indexOf(u8, resp, marker) orelse return resp;
+    const after = pos + marker.len;
+    if (after >= resp.len) return resp;
+    // String value: "value":"..."
+    if (resp[after] == '"') {
+        const end = std.mem.indexOfPos(u8, resp, after + 1, "\"") orelse return resp;
+        return resp[after + 1 .. end];
+    }
+    // Non-string value (number, bool, null, object): find end
+    const end = std.mem.indexOfAny(u8, resp[after..], "}") orelse return resp;
+    return resp[after .. after + end];
+}
+
 fn extractString(json: []const u8, start: usize, field: []const u8) ?[]const u8 {
     const field_pos = std.mem.indexOfPos(u8, json, start, field) orelse return null;
     const colon = std.mem.indexOfScalarPos(u8, json, field_pos + field.len, ':') orelse return null;
@@ -1229,6 +1255,29 @@ fn extractString(json: []const u8, start: usize, field: []const u8) ?[]const u8 
     i += 1;
     const end = std.mem.indexOfScalarPos(u8, json, i, '"') orelse return null;
     return json[i..end];
+}
+
+/// Unescape JSON string escapes: \n → newline, \t → tab, \\ → backslash, \" → quote
+fn unescapeJson(arena: std.mem.Allocator, s: []const u8) []const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    const w = buf.writer(arena);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '\\' and i + 1 < s.len) {
+            switch (s[i + 1]) {
+                'n' => { w.writeByte('\n') catch {}; i += 2; },
+                't' => { w.writeByte('\t') catch {}; i += 2; },
+                '\\' => { w.writeByte('\\') catch {}; i += 2; },
+                '"' => { w.writeByte('"') catch {}; i += 2; },
+                '/' => { w.writeByte('/') catch {}; i += 2; },
+                else => { w.writeByte(s[i]) catch {}; i += 1; },
+            }
+        } else {
+            w.writeByte(s[i]) catch {};
+            i += 1;
+        }
+    }
+    return buf.items;
 }
 
 /// Parse CDP a11y tree response into A11yNode slice.
