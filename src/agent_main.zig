@@ -16,7 +16,7 @@
 ///
 /// Navigation:  go <url>  back  forward  reload
 /// Actions:     click <ref>  type <ref> <text>  fill  select  hover  focus  scroll
-/// Inspection:  text [sel]  eval <js>  shot [--out file.png]
+/// Tab follow:  grab <ref>  wait-for-tab — click-and-follow popups, detect new tabs
 /// Security:    cookies  headers  audit  storage  jwt  fetch  probe  set-header
 
 const std = @import("std");
@@ -190,10 +190,15 @@ pub fn main() !void {
         const start_id = std.fmt.parseInt(u32, rest[1], 10) catch fatal("probe: start must be integer\n", .{});
         const end_id = std.fmt.parseInt(u32, rest[2], 10) catch fatal("probe: end must be integer\n", .{});
         try cmdProbe(arena, &client, rest[0], start_id, end_id);
+    } else if (std.mem.eql(u8, cmd, "grab")) {
+        // Override window.open, click a ref, follow the redirect in-tab
+        if (rest.len < 1) fatal("grab: requires <ref>\n", .{});
+        try cmdGrab(arena, &client, &session, rest[0]);
+    } else if (std.mem.eql(u8, cmd, "wait-for-tab")) {
+        // Poll for a new tab to appear, auto-switch to it
+        const port: u16 = parsePort(rest);
+        try cmdWaitForTab(arena, port, &session);
     } else {
-        std.debug.print("error: unknown command '{s}'\n", .{cmd});
-        printUsage();
-        std.process.exit(1);
     }
 }
 // ── Commands ─────────────────────────────────────────────────────────────────
@@ -558,6 +563,122 @@ fn cmdSimpleNav(arena: std.mem.Allocator, client: *CdpClient, method: []const u8
     };
     std.fs.File.stdout().writeAll(response) catch {};
     std.fs.File.stdout().writeAll("\n") catch {};
+}
+
+// ── Tab following ─────────────────────────────────────────────────────────────
+
+/// Override window.open → location.href, then click a ref so the redirect
+/// happens in the same tab instead of a blocked popup. Solves Google Flights
+/// style "book with X" buttons that open airline sites in new windows.
+fn cmdGrab(arena: std.mem.Allocator, client: *CdpClient, session: *Session, ref: []const u8) !void {
+    // 1. Inject window.open override that redirects in-tab
+    const inject_js =
+        \\(function(){
+        \\  window.__kuriOpenUrl = null;
+        \\  var orig = window.open;
+        \\  window.open = function(url, name, features) {
+        \\    if (url && url !== 'about:blank') {
+        \\      window.__kuriOpenUrl = url;
+        \\      location.href = url;
+        \\      return null;
+        \\    }
+        \\    return orig.call(window, url, name, features);
+        \\  };
+        \\  return 'hooked';
+        \\})()
+    ;
+    const inject_escaped = try escapeForJson(arena, inject_js);
+    const inject_params = try std.fmt.allocPrint(arena,
+        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{inject_escaped});
+    _ = client.send(arena, protocol.Methods.runtime_evaluate, inject_params) catch {};
+
+    // 2. Click the element via the normal action flow
+    try cmdAction(arena, client, session, "click", ref, null);
+
+    // 3. Wait briefly then report what happened
+    std.Thread.sleep(3_000_000_000);
+
+    // Check if we navigated to a new URL
+    const check_js = "location.href";
+    const check_escaped = try escapeForJson(arena, check_js);
+    const check_params = try std.fmt.allocPrint(arena,
+        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{check_escaped});
+    const check_resp = client.send(arena, protocol.Methods.runtime_evaluate, check_params) catch {
+        // Connection lost means the page navigated away
+        const out = try std.fmt.allocPrint(arena,
+            "{{\"ok\":true,\"action\":\"navigated\",\"note\":\"page navigated, run snap to see new page\"}}\n", .{});
+        std.fs.File.stdout().writeAll(out) catch {};
+        return;
+    };
+    const url_start = std.mem.indexOf(u8, check_resp, "\"value\":\"") orelse {
+        std.fs.File.stdout().writeAll("{\"ok\":true,\"action\":\"clicked\",\"note\":\"no redirect detected — check tabs\"}\n") catch {};
+        return;
+    };
+    const val_begin = url_start + 9;
+    const val_end = std.mem.indexOfPos(u8, check_resp, val_begin, "\"") orelse check_resp.len;
+    const new_url = check_resp[val_begin..val_end];
+
+    const out = try std.fmt.allocPrint(arena,
+        "{{\"ok\":true,\"action\":\"navigated\",\"url\":\"{s}\"}}\n", .{new_url});
+    std.fs.File.stdout().writeAll(out) catch {};
+}
+
+/// Poll Chrome /json for a new tab, auto-switch to it.
+/// Useful after a click opens a popup/new tab that wasn't caught by `grab`.
+fn cmdWaitForTab(arena: std.mem.Allocator, port: u16, session: *Session) !void {
+    // Get current tab IDs
+    const known_ws = session.cdp_url;
+
+    // Poll up to 10 seconds for a new tab
+    var attempts: u32 = 0;
+    while (attempts < 20) : (attempts += 1) {
+        const json = fetchChromeTabs(arena, "127.0.0.1", port) catch {
+            std.Thread.sleep(500_000_000);
+            continue;
+        };
+
+        // Look for a websocket URL we don't already know
+        var pos: usize = 0;
+        while (pos < json.len) {
+            const ws_start = std.mem.indexOfPos(u8, json, pos, "\"webSocketDebuggerUrl\"") orelse break;
+            const ws_val = extractString(json, ws_start, "\"webSocketDebuggerUrl\"") orelse {
+                pos = ws_start + 1;
+                continue;
+            };
+            const type_val = extractString(json, pos, "\"type\"") orelse "page";
+            if (!std.mem.eql(u8, type_val, "page")) {
+                pos = ws_start + ws_val.len + 1;
+                continue;
+            }
+
+            if (!std.mem.eql(u8, ws_val, known_ws)) {
+                // Found a new tab — switch to it
+                const url_val = extractString(json, pos, "\"url\"") orelse "";
+                const title_val = extractString(json, pos, "\"title\"") orelse "";
+                session.cdp_url = ws_val;
+                try saveSession(arena, session);
+                const out = try std.fmt.allocPrint(arena,
+                    "{{\"ok\":true,\"switched\":true,\"url\":\"{s}\",\"title\":\"{s}\",\"ws\":\"{s}\"}}\n",
+                    .{ url_val, title_val, ws_val });
+                std.fs.File.stdout().writeAll(out) catch {};
+                return;
+            }
+            pos = ws_start + ws_val.len + 1;
+        }
+        std.Thread.sleep(500_000_000);
+    }
+
+    std.fs.File.stdout().writeAll("{\"ok\":false,\"error\":\"no new tab detected after 10s\"}\n") catch {};
+}
+
+fn parsePort(args: []const []const u8) u16 {
+    var i: usize = 0;
+    while (i + 1 < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--port")) {
+            return std.fmt.parseInt(u16, args[i + 1], 10) catch 9222;
+        }
+    }
+    return 9222;
 }
 
 // ── Security ──────────────────────────────────────────────────────────────────
@@ -1121,6 +1242,8 @@ fn printUsage() void {
         \\  focus <ref>                  focus element
         \\  scroll                       scroll down 500px
         \\  viewport mobile|tablet|desktop|<w> <h>  set viewport size
+        \\  grab <ref>                   click + follow redirect in-tab (bypasses popups)
+        \\  wait-for-tab [--port N]      poll for new tab, auto-switch to it
         \\
         \\Security:
         \\  cookies                      list cookies with Secure/HttpOnly/SameSite flags
