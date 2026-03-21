@@ -248,6 +248,39 @@ fn getQueryParam(target: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+fn urlDecodeAlloc(arena: std.mem.Allocator, input: []const u8) ?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(arena);
+
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const ch = input[i];
+        if (ch == '%' and i + 2 < input.len) {
+            const hi = std.fmt.charToDigit(input[i + 1], 16) catch {
+                out.append(arena, ch) catch return null;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(input[i + 2], 16) catch {
+                out.append(arena, ch) catch return null;
+                continue;
+            };
+            out.append(arena, hi * 16 + lo) catch return null;
+            i += 2;
+            continue;
+        }
+        out.append(arena, if (ch == '+') ' ' else ch) catch return null;
+    }
+
+    return out.toOwnedSlice(arena) catch null;
+}
+
+fn resolveDiscoverCdpBase(target: []const u8, arena: std.mem.Allocator, cfg: Config) ?[]const u8 {
+    if (getQueryParam(target, "cdp_url")) |raw| {
+        return urlDecodeAlloc(arena, raw) orelse raw;
+    }
+    return cfg.cdp_url;
+}
+
 fn readRequestBody(request: *std.http.Server.Request, arena: std.mem.Allocator) ?[]const u8 {
     if (!request.head.method.requestHasBody()) return null;
     if (request.head.expect != null) return null;
@@ -699,7 +732,7 @@ fn handleBrowdie(request: *std.http.Server.Request) void {
 }
 
 fn handleDiscover(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge, cfg: Config) void {
-    const cdp_base = cfg.cdp_url orelse {
+    const cdp_base = resolveDiscoverCdpBase(request.head.target, arena, cfg) orelse {
         resp.sendError(request, 400, "No CDP_URL configured");
         return;
     };
@@ -1605,6 +1638,46 @@ test "getQueryParam" {
     try std.testing.expectEqualStrings("123", getQueryParam("/test?a=1&tab_id=123&b=2", "tab_id").?);
     try std.testing.expect(getQueryParam("/test?foo=bar", "baz") == null);
     try std.testing.expect(getQueryParam("/test", "foo") == null);
+}
+
+test "resolveDiscoverCdpBase prefers decoded query override" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 8080,
+        .cdp_url = "ws://127.0.0.1:9222",
+        .auth_secret = null,
+        .state_dir = ".browdie",
+        .stale_tab_interval_s = 30,
+        .request_timeout_ms = 30_000,
+        .navigate_timeout_ms = 30_000,
+        .extensions = null,
+        .headless = true,
+    };
+
+    const resolved = resolveDiscoverCdpBase("/discover?cdp_url=ws%3A%2F%2F127.0.0.1%3A9333", arena, cfg).?;
+    try std.testing.expectEqualStrings("ws://127.0.0.1:9333", resolved);
+}
+
+test "resolveDiscoverCdpBase falls back to config" {
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 8080,
+        .cdp_url = "ws://127.0.0.1:9222",
+        .auth_secret = null,
+        .state_dir = ".browdie",
+        .stale_tab_interval_s = 30,
+        .request_timeout_ms = 30_000,
+        .navigate_timeout_ms = 30_000,
+        .extensions = null,
+        .headless = true,
+    };
+
+    const resolved = resolveDiscoverCdpBase("/discover", std.testing.allocator, cfg).?;
+    try std.testing.expectEqualStrings("ws://127.0.0.1:9222", resolved);
 }
 
 test "emulate query param parsing" {
