@@ -30,6 +30,11 @@ pub const EventBuffer = struct {
         }
     }
 
+    pub fn pushCopy(self: *EventBuffer, event: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, event);
+        self.push(owned);
+    }
+
     /// Check if any buffered event matches a method name.
     pub fn hasEvent(self: *EventBuffer, method: []const u8) bool {
         for (self.items[0..self.len]) |item| {
@@ -125,7 +130,9 @@ pub const CdpClient = struct {
             }
 
             // Buffer event instead of discarding
-            self.event_buf.push(response);
+            errdefer allocator.free(response);
+            try self.event_buf.pushCopy(response);
+            allocator.free(response);
         }
 
         return error.ConnectionRefused;
@@ -181,7 +188,11 @@ pub const CdpClient = struct {
                 allocator.free(response);
                 return true;
             }
-            self.event_buf.push(response);
+            self.event_buf.pushCopy(response) catch {
+                allocator.free(response);
+                return false;
+            };
+            allocator.free(response);
         }
         return false;
     }
@@ -246,4 +257,18 @@ test "EventBuffer drain frees all" {
     try std.testing.expectEqual(@as(usize, 2), buf.len);
     buf.drain();
     try std.testing.expectEqual(@as(usize, 0), buf.len);
+}
+
+test "EventBuffer pushCopy owns memory from another allocator" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var buf = EventBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+
+    const arena_event = try arena.dupe(u8, "{\"method\":\"Runtime.consoleAPICalled\"}");
+    try buf.pushCopy(arena_event);
+    try std.testing.expectEqual(@as(usize, 1), buf.len);
+    try std.testing.expect(buf.hasEvent("Runtime.consoleAPICalled"));
 }

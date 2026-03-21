@@ -248,6 +248,44 @@ fn getQueryParam(target: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+fn getDecodedQueryParam(arena: std.mem.Allocator, target: []const u8, key: []const u8) ?[]const u8 {
+    const raw = getQueryParam(target, key) orelse return null;
+    return urlDecodeAlloc(arena, raw);
+}
+
+fn urlDecodeAlloc(arena: std.mem.Allocator, input: []const u8) ?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(arena);
+
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const ch = input[i];
+        if (ch == '%' and i + 2 < input.len) {
+            const hi = std.fmt.charToDigit(input[i + 1], 16) catch {
+                out.append(arena, ch) catch return null;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(input[i + 2], 16) catch {
+                out.append(arena, ch) catch return null;
+                continue;
+            };
+            out.append(arena, hi * 16 + lo) catch return null;
+            i += 2;
+            continue;
+        }
+        out.append(arena, if (ch == '+') ' ' else ch) catch return null;
+    }
+
+    return out.toOwnedSlice(arena) catch null;
+}
+
+fn resolveDiscoverCdpBase(target: []const u8, arena: std.mem.Allocator, cfg: Config) ?[]const u8 {
+    if (getQueryParam(target, "cdp_url")) |raw| {
+        return urlDecodeAlloc(arena, raw) orelse raw;
+    }
+    return cfg.cdp_url;
+}
+
 fn readRequestBody(request: *std.http.Server.Request, arena: std.mem.Allocator) ?[]const u8 {
     if (!request.head.method.requestHasBody()) return null;
     if (request.head.expect != null) return null;
@@ -293,10 +331,11 @@ fn handleTabs(request: *std.http.Server.Request, arena: std.mem.Allocator, bridg
 
 fn handleNavigate(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge, cfg: Config) void {
     const target = request.head.target;
-    const url = getQueryParam(target, "url") orelse {
+    const raw_url = getQueryParam(target, "url") orelse {
         resp.sendError(request, 400, "Missing url parameter");
         return;
     };
+    const url = getDecodedQueryParam(arena, target, "url") orelse raw_url;
     const tab_id = getQueryParam(target, "tab_id");
 
     // If we have a tab, use its CDP client
@@ -662,9 +701,15 @@ fn handleEvaluate(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         resp.sendError(request, 400, "Missing tab_id parameter");
         return;
     };
-    const expr = getQueryParam(target, "expression") orelse {
-        resp.sendError(request, 400, "Missing expression parameter");
-        return;
+    const expr = blk: {
+        if (readRequestBody(request, arena)) |body| {
+            if (body.len > 0) break :blk body;
+        }
+        const raw_expr = getQueryParam(target, "expression") orelse {
+            resp.sendError(request, 400, "Missing expression parameter");
+            return;
+        };
+        break :blk getDecodedQueryParam(arena, target, "expression") orelse raw_expr;
     };
 
     const client = bridge.getCdpClient(tab_id) orelse {
@@ -672,8 +717,12 @@ fn handleEvaluate(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         return;
     };
 
+    const escaped_expr = jsonEscapeAlloc(arena, expr) orelse {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
     const params = std.fmt.allocPrint(arena,
-        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{expr}) catch {
+        "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{escaped_expr}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -699,7 +748,7 @@ fn handleBrowdie(request: *std.http.Server.Request) void {
 }
 
 fn handleDiscover(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge, cfg: Config) void {
-    const cdp_base = cfg.cdp_url orelse {
+    const cdp_base = resolveDiscoverCdpBase(request.head.target, arena, cfg) orelse {
         resp.sendError(request, 400, "No CDP_URL configured");
         return;
     };
@@ -977,7 +1026,7 @@ fn handleHarStop(request: *std.http.Server.Request, arena: std.mem.Allocator, br
             while (flush_read < 200) : (flush_read += 1) {
                 const msg = ws.receiveMessageAlloc(arena, 2 * 1024 * 1024) catch break;
                 rec.handleCdpEvent(msg);
-                client.event_buf.push(msg);
+                client.event_buf.pushCopy(msg) catch break;
             }
             std.log.info("HAR: read {d} pending WS messages", .{flush_read});
 
@@ -1186,9 +1235,28 @@ fn handleCookies(request: *std.http.Server.Request, arena: std.mem.Allocator, br
 
     if (name != null and value != null) {
         // Set cookie
-        const domain = getQueryParam(target, "domain") orelse "localhost";
+        const decoded_name = getDecodedQueryParam(arena, target, "name") orelse name.?;
+        const decoded_value = getDecodedQueryParam(arena, target, "value") orelse value.?;
+        const domain = getDecodedQueryParam(arena, target, "domain") orelse "localhost";
+        const path = getDecodedQueryParam(arena, target, "path") orelse "/";
+        const escaped_name = jsonEscapeAlloc(arena, decoded_name) orelse {
+            resp.sendError(request, 500, "Internal Server Error");
+            return;
+        };
+        const escaped_value = jsonEscapeAlloc(arena, decoded_value) orelse {
+            resp.sendError(request, 500, "Internal Server Error");
+            return;
+        };
+        const escaped_domain = jsonEscapeAlloc(arena, domain) orelse {
+            resp.sendError(request, 500, "Internal Server Error");
+            return;
+        };
+        const escaped_path = jsonEscapeAlloc(arena, path) orelse {
+            resp.sendError(request, 500, "Internal Server Error");
+            return;
+        };
         const params = std.fmt.allocPrint(arena,
-            "{{\"name\":\"{s}\",\"value\":\"{s}\",\"domain\":\"{s}\",\"path\":\"/\"}}", .{ name.?, value.?, domain }) catch {
+            "{{\"name\":\"{s}\",\"value\":\"{s}\",\"domain\":\"{s}\",\"path\":\"{s}\"}}", .{ escaped_name, escaped_value, escaped_domain, escaped_path }) catch {
             resp.sendError(request, 500, "Internal Server Error");
             return;
         };
@@ -1605,6 +1673,65 @@ test "getQueryParam" {
     try std.testing.expectEqualStrings("123", getQueryParam("/test?a=1&tab_id=123&b=2", "tab_id").?);
     try std.testing.expect(getQueryParam("/test?foo=bar", "baz") == null);
     try std.testing.expect(getQueryParam("/test", "foo") == null);
+}
+
+test "resolveDiscoverCdpBase prefers decoded query override" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 8080,
+        .cdp_url = "ws://127.0.0.1:9222",
+        .auth_secret = null,
+        .state_dir = ".browdie",
+        .stale_tab_interval_s = 30,
+        .request_timeout_ms = 30_000,
+        .navigate_timeout_ms = 30_000,
+        .extensions = null,
+        .headless = true,
+    };
+
+    const resolved = resolveDiscoverCdpBase("/discover?cdp_url=ws%3A%2F%2F127.0.0.1%3A9333", arena, cfg).?;
+    try std.testing.expectEqualStrings("ws://127.0.0.1:9333", resolved);
+}
+
+test "getDecodedQueryParam decodes encoded cookie payload" {
+    const decoded_name = getDecodedQueryParam(std.testing.allocator, "/cookies?tab_id=t1&name=li_at&value=AQEDAS%2Fwith%3Ddelims%26more&domain=.linkedin.com&path=%2F", "name").?;
+    defer std.testing.allocator.free(decoded_name);
+    const decoded_value = getDecodedQueryParam(std.testing.allocator, "/cookies?tab_id=t1&name=li_at&value=AQEDAS%2Fwith%3Ddelims%26more&domain=.linkedin.com&path=%2F", "value").?;
+    defer std.testing.allocator.free(decoded_value);
+    const decoded_path = getDecodedQueryParam(std.testing.allocator, "/cookies?tab_id=t1&name=li_at&value=AQEDAS%2Fwith%3Ddelims%26more&domain=.linkedin.com&path=%2F", "path").?;
+    defer std.testing.allocator.free(decoded_path);
+
+    try std.testing.expectEqualStrings("li_at", decoded_name);
+    try std.testing.expectEqualStrings("AQEDAS/with=delims&more", decoded_value);
+    try std.testing.expectEqualStrings("/", decoded_path);
+}
+
+test "getDecodedQueryParam decodes encoded navigate URL" {
+    const decoded = getDecodedQueryParam(std.testing.allocator, "/navigate?tab_id=t1&url=https%3A%2F%2Fwww.linkedin.com%2Fsearch%2Fresults%2Fpeople%2F%3Fkeywords%3Dopenai", "url").?;
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("https://www.linkedin.com/search/results/people/?keywords=openai", decoded);
+}
+
+test "resolveDiscoverCdpBase falls back to config" {
+    const cfg = Config{
+        .host = "127.0.0.1",
+        .port = 8080,
+        .cdp_url = "ws://127.0.0.1:9222",
+        .auth_secret = null,
+        .state_dir = ".browdie",
+        .stale_tab_interval_s = 30,
+        .request_timeout_ms = 30_000,
+        .navigate_timeout_ms = 30_000,
+        .extensions = null,
+        .headless = true,
+    };
+
+    const resolved = resolveDiscoverCdpBase("/discover", std.testing.allocator, cfg).?;
+    try std.testing.expectEqualStrings("ws://127.0.0.1:9222", resolved);
 }
 
 test "emulate query param parsing" {
