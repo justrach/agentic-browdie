@@ -11,8 +11,9 @@ const json_util = @import("../util/json.zig");
 const protocol = @import("../cdp/protocol.zig");
 const HarRecorder = @import("../cdp/har.zig").HarRecorder;
 const CdpClient = @import("../cdp/client.zig").CdpClient;
+const auth_profiles = @import("../storage/auth_profiles.zig");
 
-pub fn run(gpa: std.mem.Allocator, bridge: *Bridge, cfg: Config) !void {
+pub fn run(gpa: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_port: u16) !void {
     const address = try net.Address.parseIp4(cfg.host, cfg.port);
     var tcp_server = try address.listen(.{
         .reuse_address = true,
@@ -27,7 +28,7 @@ pub fn run(gpa: std.mem.Allocator, bridge: *Bridge, cfg: Config) !void {
             continue;
         };
 
-        const thread = std.Thread.spawn(.{}, handleConnection, .{ gpa, bridge, cfg, conn }) catch |err| {
+        const thread = std.Thread.spawn(.{}, handleConnection, .{ gpa, bridge, cfg, cdp_port, conn }) catch |err| {
             std.log.err("thread spawn error: {s}", .{@errorName(err)});
             conn.stream.close();
             continue;
@@ -36,7 +37,7 @@ pub fn run(gpa: std.mem.Allocator, bridge: *Bridge, cfg: Config) !void {
     }
 }
 
-fn handleConnection(gpa: std.mem.Allocator, bridge: *Bridge, cfg: Config, conn: net.Server.Connection) void {
+fn handleConnection(gpa: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_port: u16, conn: net.Server.Connection) void {
     defer conn.stream.close();
 
     var arena_impl = std.heap.ArenaAllocator.init(gpa);
@@ -62,7 +63,7 @@ fn handleConnection(gpa: std.mem.Allocator, bridge: *Bridge, cfg: Config, conn: 
             return;
         }
 
-        route(&request, arena, bridge, cfg);
+        route(&request, arena, bridge, cfg, cdp_port);
 
         if (!request.head.keep_alive) return;
 
@@ -71,7 +72,7 @@ fn handleConnection(gpa: std.mem.Allocator, bridge: *Bridge, cfg: Config, conn: 
     }
 }
 
-fn route(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge, cfg: Config) void {
+fn route(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_port: u16) void {
     const path = request.head.target;
     const clean_path = if (std.mem.indexOfScalar(u8, path, '?')) |idx| path[0..idx] else path;
 
@@ -80,7 +81,7 @@ fn route(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *B
     } else if (std.mem.eql(u8, clean_path, "/tabs")) {
         handleTabs(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/discover")) {
-        handleDiscover(request, arena, bridge, cfg);
+        handleDiscover(request, arena, bridge, cfg, cdp_port);
     } else if (std.mem.eql(u8, clean_path, "/navigate")) {
         handleNavigate(request, arena, bridge, cfg);
     } else if (std.mem.eql(u8, clean_path, "/snapshot")) {
@@ -135,6 +136,14 @@ fn route(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *B
         handleSessionSave(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/session/load")) {
         handleSessionLoad(request, arena, bridge);
+    } else if (std.mem.eql(u8, clean_path, "/auth/profile/save")) {
+        handleAuthProfileSave(request, arena, bridge, cfg);
+    } else if (std.mem.eql(u8, clean_path, "/auth/profile/load")) {
+        handleAuthProfileLoad(request, arena, bridge, cfg);
+    } else if (std.mem.eql(u8, clean_path, "/auth/profile/list")) {
+        handleAuthProfileList(request, arena, cfg);
+    } else if (std.mem.eql(u8, clean_path, "/auth/profile/delete")) {
+        handleAuthProfileDelete(request, arena, cfg);
     } else if (std.mem.eql(u8, clean_path, "/screenshot/annotated")) {
         handleAnnotatedScreenshot(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/screenshot/diff")) {
@@ -284,7 +293,13 @@ fn handleTabs(request: *std.http.Server.Request, arena: std.mem.Allocator, bridg
     writer.writeAll("[") catch return;
     for (tabs, 0..) |tab, i| {
         if (i > 0) writer.writeAll(",") catch return;
-        writer.print("{{\"id\":\"{s}\",\"url\":\"{s}\",\"title\":\"{s}\"}}", .{ tab.id, tab.url, tab.title }) catch return;
+        writer.writeAll("{") catch return;
+        writeJsonField(writer, arena, "id", tab.id) catch return;
+        writer.writeAll(",") catch return;
+        writeJsonField(writer, arena, "url", tab.url) catch return;
+        writer.writeAll(",") catch return;
+        writeJsonField(writer, arena, "title", tab.title) catch return;
+        writer.writeAll("}") catch return;
     }
     writer.writeAll("]") catch return;
 
@@ -420,7 +435,7 @@ fn handleSnapshot(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         };
 
         // Clear old refs and repopulate
-        ref_cache.refs.clearRetainingCapacity();
+        ref_cache.clear();
         for (snapshot) |node| {
             if (node.backend_node_id) |bid| {
                 const owned_ref = bridge.allocator.dupe(u8, node.ref) catch continue;
@@ -451,9 +466,15 @@ fn sendSnapshotResponse(request: *std.http.Server.Request, arena: std.mem.Alloca
     writer.writeAll("[") catch return;
     for (snapshot, 0..) |node, i| {
         if (i > 0) writer.writeAll(",") catch return;
-        writer.print("{{\"ref\":\"{s}\",\"role\":\"{s}\",\"name\":\"{s}\"", .{ node.ref, node.role, node.name }) catch return;
+        writer.writeAll("{") catch return;
+        writeJsonField(writer, arena, "ref", node.ref) catch return;
+        writer.writeAll(",") catch return;
+        writeJsonField(writer, arena, "role", node.role) catch return;
+        writer.writeAll(",") catch return;
+        writeJsonField(writer, arena, "name", node.name) catch return;
         if (node.value.len > 0) {
-            writer.print(",\"value\":\"{s}\"", .{node.value}) catch return;
+            writer.writeAll(",") catch return;
+            writeJsonField(writer, arena, "value", node.value) catch return;
         }
         writer.writeAll("}") catch return;
     }
@@ -698,36 +719,13 @@ fn handleBrowdie(request: *std.http.Server.Request) void {
     resp.sendJson(request, browdie);
 }
 
-fn handleDiscover(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge, cfg: Config) void {
-    const cdp_base = cfg.cdp_url orelse {
-        resp.sendError(request, 400, "No CDP_URL configured");
-        return;
-    };
+pub fn discoverTabs(arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_port: u16) !usize {
+    const cdp_addr = parseCdpAddress(cfg.cdp_url, cdp_port);
+    const host = cdp_addr.host;
+    const port = cdp_addr.port;
 
-    // Parse host:port from CDP URL (strip ws:// prefix and path)
-    const after_scheme = if (std.mem.startsWith(u8, cdp_base, "ws://"))
-        cdp_base[5..]
-    else
-        cdp_base;
-    const host_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
-    const host_port = after_scheme[0..host_end];
-
-    var host: []const u8 = "127.0.0.1";
-    var port: u16 = 9222;
-    if (std.mem.indexOfScalar(u8, host_port, ':')) |colon| {
-        host = host_port[0..colon];
-        if (std.mem.eql(u8, host, "localhost")) host = "127.0.0.1";
-        port = std.fmt.parseInt(u16, host_port[colon + 1 ..], 10) catch 9222;
-    }
-
-    const address = net.Address.parseIp4(host, port) catch {
-        resp.sendError(request, 502, "Cannot resolve Chrome address");
-        return;
-    };
-    const stream = net.tcpConnectToAddress(address) catch {
-        resp.sendError(request, 502, "Cannot connect to Chrome");
-        return;
-    };
+    const address = net.Address.parseIp4(host, port) catch return error.CannotResolveChromeAddress;
+    const stream = net.tcpConnectToAddress(address) catch return error.CannotConnectToChrome;
     defer stream.close();
 
     // Set read timeout (2 seconds) to avoid blocking forever
@@ -735,14 +733,8 @@ fn handleDiscover(request: *std.http.Server.Request, arena: std.mem.Allocator, b
     std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 
     // HTTP/1.1 required — Chrome ignores HTTP/1.0
-    const http_req = std.fmt.allocPrint(arena, "GET /json/list HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n", .{ host, port }) catch {
-        resp.sendError(request, 500, "Internal Server Error");
-        return;
-    };
-    stream.writeAll(http_req) catch {
-        resp.sendError(request, 502, "Failed to send request to Chrome");
-        return;
-    };
+    const http_req = try std.fmt.allocPrint(arena, "GET /json/list HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n", .{ host, port });
+    try stream.writeAll(http_req);
 
     // Read response with Content-Length awareness
     var response_buf: [65536]u8 = undefined;
@@ -761,16 +753,10 @@ fn handleDiscover(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         }
     }
 
-    if (total == 0) {
-        resp.sendError(request, 502, "Empty response from Chrome");
-        return;
-    }
+    if (total == 0) return error.EmptyResponseFromChrome;
     const raw_response = response_buf[0..total];
 
-    const body_start = (std.mem.indexOf(u8, raw_response, "\r\n\r\n") orelse {
-        resp.sendError(request, 502, "Invalid response from Chrome");
-        return;
-    }) + 4;
+    const body_start = (std.mem.indexOf(u8, raw_response, "\r\n\r\n") orelse return error.InvalidChromeResponse) + 4;
     const body = raw_response[body_start..total];
 
     // Parse targets and register tabs
@@ -789,16 +775,15 @@ fn handleDiscover(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         const ws_val = extractSimpleJsonString(body, id_start, "\"webSocketDebuggerUrl\"") orelse "";
 
         if (std.mem.eql(u8, type_val, "page") and ws_val.len > 0) {
-            // Dupe strings into arena so they outlive the stack buffer
             const entry = TabEntry{
-                .id = arena.dupe(u8, id_val) catch id_val,
-                .url = arena.dupe(u8, url_val) catch url_val,
-                .title = arena.dupe(u8, title_val) catch title_val,
-                .ws_url = arena.dupe(u8, ws_val) catch ws_val,
+                .id = id_val,
+                .url = url_val,
+                .title = title_val,
+                .ws_url = ws_val,
                 .created_at = @intCast(std.time.timestamp()),
                 .last_accessed = @intCast(std.time.timestamp()),
             };
-            bridge.putTab(entry) catch {};
+            try bridge.putTab(entry);
             registered += 1;
         }
 
@@ -806,12 +791,37 @@ fn handleDiscover(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         pos = next_id;
     }
 
+    return registered;
+}
+
+fn handleDiscover(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_port: u16) void {
+    const registered = discoverTabs(arena, bridge, cfg, cdp_port) catch |err| {
+        switch (err) {
+            error.CannotResolveChromeAddress => resp.sendError(request, 502, "Cannot resolve Chrome address"),
+            error.CannotConnectToChrome => resp.sendError(request, 502, "Cannot connect to Chrome"),
+            error.EmptyResponseFromChrome => resp.sendError(request, 502, "Empty response from Chrome"),
+            error.InvalidChromeResponse => resp.sendError(request, 502, "Invalid response from Chrome"),
+            else => resp.sendError(request, 500, "Internal Server Error"),
+        }
+        return;
+    };
+
     const result = std.fmt.allocPrint(arena,
         "{{\"discovered\":{d},\"total_tabs\":{d}}}", .{ registered, bridge.tabCount() }) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
     resp.sendJson(request, result);
+}
+
+fn freeOwnedSnapshot(allocator: std.mem.Allocator, snapshot: []const @import("../snapshot/a11y.zig").A11yNode) void {
+    for (snapshot) |node| {
+        allocator.free(node.ref);
+        allocator.free(node.role);
+        allocator.free(node.name);
+        allocator.free(node.value);
+    }
+    allocator.free(snapshot);
 }
 
 fn findContentLength(headers: []const u8) ?usize {
@@ -826,6 +836,44 @@ fn findContentLength(headers: []const u8) ?usize {
         }
     }
     return null;
+}
+
+const CdpAddress = struct {
+    host: []const u8,
+    port: u16,
+};
+
+fn parseCdpAddress(cdp_url: ?[]const u8, fallback_port: u16) CdpAddress {
+    const raw = cdp_url orelse return .{ .host = "127.0.0.1", .port = fallback_port };
+    var remainder = raw;
+    var default_port = fallback_port;
+
+    if (std.mem.startsWith(u8, raw, "ws://")) {
+        remainder = raw[5..];
+        default_port = 80;
+    } else if (std.mem.startsWith(u8, raw, "wss://")) {
+        remainder = raw[6..];
+        default_port = 443;
+    } else if (std.mem.startsWith(u8, raw, "http://")) {
+        remainder = raw[7..];
+        default_port = 80;
+    } else if (std.mem.startsWith(u8, raw, "https://")) {
+        remainder = raw[8..];
+        default_port = 443;
+    }
+
+    const host_end = std.mem.indexOfScalar(u8, remainder, '/') orelse remainder.len;
+    const host_port = remainder[0..host_end];
+    if (std.mem.indexOfScalar(u8, host_port, ':')) |colon| {
+        var host = host_port[0..colon];
+        if (std.mem.eql(u8, host, "localhost")) host = "127.0.0.1";
+        const port = std.fmt.parseInt(u16, host_port[colon + 1 ..], 10) catch default_port;
+        return .{ .host = host, .port = port };
+    }
+
+    var host = host_port;
+    if (std.mem.eql(u8, host, "localhost")) host = "127.0.0.1";
+    return .{ .host = host, .port = default_port };
 }
 
 fn extractSimpleJsonString(json: []const u8, start: usize, field: []const u8) ?[]const u8 {
@@ -1444,9 +1492,9 @@ fn handleDiffSnapshot(request: *std.http.Server.Request, arena: std.mem.Allocato
     };
 
     // Get previous snapshot from bridge (empty if first call)
-    bridge.mu.lock();
+    bridge.mu.lockShared();
     const prev_nodes = if (bridge.prev_snapshots.get(tab_id)) |prev| prev else &[_]a11y.A11yNode{};
-    bridge.mu.unlock();
+    bridge.mu.unlockShared();
 
     // Compute diff
     const diff_mod = @import("../snapshot/diff.zig");
@@ -1456,10 +1504,30 @@ fn handleDiffSnapshot(request: *std.http.Server.Request, arena: std.mem.Allocato
     };
 
     // Store current snapshot as previous for next diff
+    const owned_current = bridge.cloneSnapshot(current) catch {
+        resp.sendError(request, 500, "Failed to persist snapshot");
+        return;
+    };
     {
         bridge.mu.lock();
         defer bridge.mu.unlock();
-        bridge.prev_snapshots.put(tab_id, current) catch {};
+
+        if (bridge.prev_snapshots.fetchRemove(tab_id)) |kv| {
+            freeOwnedSnapshot(bridge.allocator, kv.value);
+            bridge.allocator.free(kv.key);
+        }
+
+        const owned_key = bridge.allocator.dupe(u8, tab_id) catch {
+            freeOwnedSnapshot(bridge.allocator, owned_current);
+            resp.sendError(request, 500, "Failed to persist snapshot");
+            return;
+        };
+        bridge.prev_snapshots.put(owned_key, owned_current) catch {
+            bridge.allocator.free(owned_key);
+            freeOwnedSnapshot(bridge.allocator, owned_current);
+            resp.sendError(request, 500, "Failed to persist snapshot");
+            return;
+        };
     }
 
     // Serialize diff as JSON
@@ -1473,10 +1541,24 @@ fn handleDiffSnapshot(request: *std.http.Server.Request, arena: std.mem.Allocato
             .removed => "removed",
             .changed => "changed",
         };
-        writer.print("{{\"kind\":\"{s}\",\"ref\":\"{s}\",\"role\":\"{s}\",\"name\":\"{s}\"}}", .{ kind_str, entry.node.ref, entry.node.role, entry.node.name }) catch return;
+        writer.writeAll("{") catch return;
+        writeJsonField(writer, arena, "kind", kind_str) catch return;
+        writer.writeAll(",") catch return;
+        writeJsonField(writer, arena, "ref", entry.node.ref) catch return;
+        writer.writeAll(",") catch return;
+        writeJsonField(writer, arena, "role", entry.node.role) catch return;
+        writer.writeAll(",") catch return;
+        writeJsonField(writer, arena, "name", entry.node.name) catch return;
+        writer.writeAll("}") catch return;
     }
     writer.writeAll("]") catch return;
     resp.sendJson(request, json_buf.items);
+}
+
+fn writeJsonField(writer: anytype, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    const escaped = try json_util.jsonEscape(value, allocator);
+    defer allocator.free(escaped);
+    try writer.print("\"{s}\":\"{s}\"", .{ key, escaped });
 }
 
 fn handleEmulate(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge) void {
@@ -1664,6 +1746,234 @@ fn handleSessionLoad(request: *std.http.Server.Request, arena: std.mem.Allocator
         return;
     };
     resp.sendJson(request, result);
+}
+
+fn handleAuthProfileSave(
+    request: *std.http.Server.Request,
+    arena: std.mem.Allocator,
+    bridge: *Bridge,
+    cfg: Config,
+) void {
+    const target = request.head.target;
+    const tab_id = getQueryParam(target, "tab_id") orelse {
+        resp.sendError(request, 400, "Missing tab_id parameter");
+        return;
+    };
+    const name = getQueryParam(target, "name") orelse {
+        resp.sendError(request, 400, "Missing name parameter");
+        return;
+    };
+    const client = bridge.getCdpClient(tab_id) orelse {
+        resp.sendError(request, 404, "Tab not found");
+        return;
+    };
+
+    const origin = evalValueString(arena, client, "location.origin") orelse {
+        resp.sendError(request, 502, "Failed to determine page origin");
+        return;
+    };
+    const cookies_response = client.send(arena, protocol.Methods.network_get_cookies, null) catch {
+        resp.sendError(request, 502, "Failed to collect cookies");
+        return;
+    };
+    const cookies_json = extractJsonArrayField(cookies_response, "\"cookies\"") orelse {
+        resp.sendError(request, 502, "Failed to parse cookies");
+        return;
+    };
+    const local_storage = evalValueObject(
+        arena,
+        client,
+        "Object.fromEntries(Object.entries(localStorage))",
+    ) orelse "{}";
+    const session_storage = evalValueObject(
+        arena,
+        client,
+        "Object.fromEntries(Object.entries(sessionStorage))",
+    ) orelse "{}";
+    const escaped_name = jsonEscapeAlloc(arena, name) orelse {
+        resp.sendError(request, 500, "Failed to escape profile name");
+        return;
+    };
+    const escaped_origin = jsonEscapeAlloc(arena, origin) orelse {
+        resp.sendError(request, 500, "Failed to escape profile origin");
+        return;
+    };
+    const payload = std.fmt.allocPrint(
+        arena,
+        "{{\"version\":1,\"name\":\"{s}\",\"origin\":\"{s}\",\"saved_at\":{d},\"cookies\":{s},\"local_storage\":{s},\"session_storage\":{s}}}",
+        .{ escaped_name, escaped_origin, std.time.timestamp(), cookies_json, local_storage, session_storage },
+    ) catch {
+        resp.sendError(request, 500, "Failed to build auth profile payload");
+        return;
+    };
+
+    const backend = auth_profiles.saveProfile(arena, cfg.state_dir, name, origin, payload) catch |err| {
+        resp.sendError(request, 500, @errorName(err));
+        return;
+    };
+    const body = std.fmt.allocPrint(
+        arena,
+        "{{\"status\":\"saved\",\"name\":\"{s}\",\"origin\":\"{s}\",\"backend\":\"{s}\"}}",
+        .{ escaped_name, escaped_origin, if (backend == .keychain) "keychain" else "file" },
+    ) catch {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
+    resp.sendJson(request, body);
+}
+
+fn handleAuthProfileLoad(
+    request: *std.http.Server.Request,
+    arena: std.mem.Allocator,
+    bridge: *Bridge,
+    cfg: Config,
+) void {
+    const target = request.head.target;
+    const tab_id = getQueryParam(target, "tab_id") orelse {
+        resp.sendError(request, 400, "Missing tab_id parameter");
+        return;
+    };
+    const name = getQueryParam(target, "name") orelse {
+        resp.sendError(request, 400, "Missing name parameter");
+        return;
+    };
+    const client = bridge.getCdpClient(tab_id) orelse {
+        resp.sendError(request, 404, "Tab not found");
+        return;
+    };
+
+    const payload = auth_profiles.loadProfile(arena, cfg.state_dir, name) catch |err| {
+        resp.sendError(request, 404, @errorName(err));
+        return;
+    };
+    const origin = extractSimpleJsonString(payload, 0, "\"origin\"") orelse {
+        resp.sendError(request, 500, "Invalid auth profile payload");
+        return;
+    };
+    const cookies_json = extractJsonArrayField(payload, "\"cookies\"") orelse "[]";
+    const local_storage = extractJsonObjectField(payload, "\"local_storage\"") orelse "{}";
+    const session_storage = extractJsonObjectField(payload, "\"session_storage\"") orelse "{}";
+
+    const current_origin = evalValueString(arena, client, "location.origin");
+    if (current_origin == null or !std.mem.eql(u8, current_origin.?, origin)) {
+        const nav_params = std.fmt.allocPrint(arena, "{{\"url\":\"{s}\"}}", .{origin}) catch {
+            resp.sendError(request, 500, "Failed to build navigation parameters");
+            return;
+        };
+        _ = client.send(arena, protocol.Methods.page_navigate, nav_params) catch {
+            resp.sendError(request, 502, "Failed to navigate to auth profile origin");
+            return;
+        };
+        _ = client.waitForEvent(arena, "Page.loadEventFired", 1_000);
+    }
+
+    const set_cookies = std.fmt.allocPrint(arena, "{{\"cookies\":{s}}}", .{cookies_json}) catch {
+        resp.sendError(request, 500, "Failed to build cookie restore payload");
+        return;
+    };
+    _ = client.send(arena, protocol.Methods.network_set_cookies, set_cookies) catch {
+        resp.sendError(request, 502, "Failed to restore cookies");
+        return;
+    };
+
+    if (!applyStorageSnapshot(arena, client, "localStorage", local_storage)) {
+        resp.sendError(request, 502, "Failed to restore localStorage");
+        return;
+    }
+    if (!applyStorageSnapshot(arena, client, "sessionStorage", session_storage)) {
+        resp.sendError(request, 502, "Failed to restore sessionStorage");
+        return;
+    }
+
+    const escaped_name = jsonEscapeAlloc(arena, name) orelse {
+        resp.sendError(request, 500, "Failed to escape profile name");
+        return;
+    };
+    const escaped_origin = jsonEscapeAlloc(arena, origin) orelse {
+        resp.sendError(request, 500, "Failed to escape profile origin");
+        return;
+    };
+    const body = std.fmt.allocPrint(
+        arena,
+        "{{\"status\":\"loaded\",\"name\":\"{s}\",\"origin\":\"{s}\"}}",
+        .{ escaped_name, escaped_origin },
+    ) catch {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
+    resp.sendJson(request, body);
+}
+
+fn handleAuthProfileList(
+    request: *std.http.Server.Request,
+    arena: std.mem.Allocator,
+    cfg: Config,
+) void {
+    const profiles = auth_profiles.listProfiles(arena, cfg.state_dir) catch |err| {
+        resp.sendError(request, 500, @errorName(err));
+        return;
+    };
+    defer auth_profiles.freeProfiles(arena, profiles);
+
+    var json_buf: std.ArrayList(u8) = .empty;
+    const writer = json_buf.writer(arena);
+    writer.writeAll("{\"profiles\":[") catch {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
+    for (profiles, 0..) |profile, i| {
+        if (i > 0) writer.writeAll(",") catch {};
+        const escaped_name = jsonEscapeAlloc(arena, profile.name) orelse {
+            resp.sendError(request, 500, "Failed to encode profile name");
+            return;
+        };
+        const escaped_origin = jsonEscapeAlloc(arena, profile.origin) orelse {
+            resp.sendError(request, 500, "Failed to encode profile origin");
+            return;
+        };
+        writer.print(
+            "{{\"name\":\"{s}\",\"origin\":\"{s}\",\"saved_at\":{d},\"backend\":\"{s}\"}}",
+            .{
+                escaped_name,
+                escaped_origin,
+                profile.saved_at,
+                if (profile.backend == .keychain) "keychain" else "file",
+            },
+        ) catch {
+            resp.sendError(request, 500, "Internal Server Error");
+            return;
+        };
+    }
+    writer.writeAll("]}") catch {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
+    resp.sendJson(request, json_buf.items);
+}
+
+fn handleAuthProfileDelete(
+    request: *std.http.Server.Request,
+    arena: std.mem.Allocator,
+    cfg: Config,
+) void {
+    const target = request.head.target;
+    const name = getQueryParam(target, "name") orelse {
+        resp.sendError(request, 400, "Missing name parameter");
+        return;
+    };
+    auth_profiles.deleteProfile(arena, cfg.state_dir, name) catch |err| {
+        resp.sendError(request, 404, @errorName(err));
+        return;
+    };
+    const escaped_name = jsonEscapeAlloc(arena, name) orelse {
+        resp.sendError(request, 500, "Failed to escape profile name");
+        return;
+    };
+    const body = std.fmt.allocPrint(arena, "{{\"status\":\"deleted\",\"name\":\"{s}\"}}", .{escaped_name}) catch {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
+    resp.sendJson(request, body);
 }
 
 // ── Annotated / Diff Screenshot & Screencast Endpoints ──────────────────
@@ -2159,6 +2469,80 @@ fn jsonEscapeAlloc(allocator: std.mem.Allocator, input: []const u8) ?[]const u8 
         }
     }
     return buf;
+}
+
+fn evalValueString(arena: std.mem.Allocator, client: *CdpClient, expression: []const u8) ?[]const u8 {
+    const escaped = jsonEscapeAlloc(arena, expression) orelse return null;
+    const params = std.fmt.allocPrint(arena, "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{escaped}) catch return null;
+    const response = client.send(arena, protocol.Methods.runtime_evaluate, params) catch return null;
+    return extractSimpleJsonString(response, 0, "\"value\"");
+}
+
+fn evalValueObject(arena: std.mem.Allocator, client: *CdpClient, expression: []const u8) ?[]const u8 {
+    const escaped = jsonEscapeAlloc(arena, expression) orelse return null;
+    const params = std.fmt.allocPrint(arena, "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{escaped}) catch return null;
+    const response = client.send(arena, protocol.Methods.runtime_evaluate, params) catch return null;
+    return extractJsonObjectField(response, "\"value\"");
+}
+
+fn applyStorageSnapshot(
+    arena: std.mem.Allocator,
+    client: *CdpClient,
+    storage_name: []const u8,
+    object_json: []const u8,
+) bool {
+    const js = std.fmt.allocPrint(
+        arena,
+        "(() => {{ const data = {s}; {s}.clear(); for (const [k, v] of Object.entries(data)) {s}.setItem(k, String(v)); return Object.keys(data).length; }})()",
+        .{ object_json, storage_name, storage_name },
+    ) catch return false;
+    const escaped = jsonEscapeAlloc(arena, js) orelse return false;
+    const params = std.fmt.allocPrint(arena, "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{escaped}) catch return false;
+    _ = client.send(arena, protocol.Methods.runtime_evaluate, params) catch return false;
+    return true;
+}
+
+fn extractJsonArrayField(json: []const u8, field: []const u8) ?[]const u8 {
+    return extractJsonDelimitedField(json, field, '[', ']');
+}
+
+fn extractJsonObjectField(json: []const u8, field: []const u8) ?[]const u8 {
+    return extractJsonDelimitedField(json, field, '{', '}');
+}
+
+fn extractJsonDelimitedField(json: []const u8, field: []const u8, open: u8, close: u8) ?[]const u8 {
+    const field_pos = std.mem.indexOf(u8, json, field) orelse return null;
+    const colon = std.mem.indexOfScalarPos(u8, json, field_pos + field.len, ':') orelse return null;
+    const start = std.mem.indexOfScalarPos(u8, json, colon + 1, open) orelse return null;
+
+    var depth: usize = 0;
+    var i = start;
+    var in_string = false;
+    var escaped = false;
+    while (i < json.len) : (i += 1) {
+        const c = json[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == open) depth += 1;
+        if (c == close) {
+            depth -= 1;
+            if (depth == 0) return json[start .. i + 1];
+        }
+    }
+    return null;
 }
 
 fn handleStop(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge) void {
@@ -3417,6 +3801,7 @@ test "total endpoint count" {
         "/get", "/back", "/forward", "/reload",
         "/diff/snapshot", "/emulate", "/geolocation", "/upload",
         "/session/save", "/session/load",
+        "/auth/profile/save", "/auth/profile/load", "/auth/profile/list", "/auth/profile/delete",
         "/screenshot/annotated", "/screenshot/diff",
         "/screencast/start", "/screencast/stop", "/video/start", "/video/stop",
         "/console", "/intercept/start", "/intercept/stop",
@@ -3441,7 +3826,7 @@ test "total endpoint count" {
         "/dom/attributes", "/frames", "/network",
         "/perf/lcp",
     };
-    try std.testing.expectEqual(@as(usize, 76), routes.len);
+    try std.testing.expectEqual(@as(usize, 80), routes.len);
 }
 
 test "buildGetExpression title" {
@@ -3597,6 +3982,19 @@ test "network route parameters" {
     try std.testing.expectEqualStrings("disable", getQueryParam(target, "mode").?);
 }
 
+test "auth profile routes parse correctly" {
+    const save_target = "/auth/profile/save?tab_id=t1&name=google";
+    try std.testing.expectEqualStrings("t1", getQueryParam(save_target, "tab_id").?);
+    try std.testing.expectEqualStrings("google", getQueryParam(save_target, "name").?);
+
+    const load_target = "/auth/profile/load?tab_id=t1&name=google";
+    try std.testing.expectEqualStrings("t1", getQueryParam(load_target, "tab_id").?);
+    try std.testing.expectEqualStrings("google", getQueryParam(load_target, "name").?);
+
+    const delete_target = "/auth/profile/delete?name=google";
+    try std.testing.expectEqualStrings("google", getQueryParam(delete_target, "name").?);
+}
+
 test "jsonEscapeAlloc escapes special chars" {
     const arena = std.testing.allocator;
     // No escaping needed
@@ -3609,6 +4007,33 @@ test "jsonEscapeAlloc escapes special chars" {
     const nl = jsonEscapeAlloc(arena, "line1\nline2\r\n").?;
     defer arena.free(nl);
     try std.testing.expectEqualStrings("line1\\nline2\\r\\n", nl);
+}
+
+test "parseCdpAddress falls back to managed chrome port" {
+    const addr = parseCdpAddress(null, 9224);
+    try std.testing.expectEqualStrings("127.0.0.1", addr.host);
+    try std.testing.expectEqual(@as(u16, 9224), addr.port);
+}
+
+test "parseCdpAddress accepts http discovery endpoint" {
+    const addr = parseCdpAddress("http://localhost:9333/json/version", 9224);
+    try std.testing.expectEqualStrings("127.0.0.1", addr.host);
+    try std.testing.expectEqual(@as(u16, 9333), addr.port);
+}
+
+test "parseCdpAddress accepts websocket endpoint path" {
+    const addr = parseCdpAddress("ws://127.0.0.1:9444/devtools/browser/abc", 9224);
+    try std.testing.expectEqualStrings("127.0.0.1", addr.host);
+    try std.testing.expectEqual(@as(u16, 9444), addr.port);
+}
+
+test "writeJsonField escapes embedded quotes" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const writer = buf.writer(std.testing.allocator);
+
+    try writeJsonField(writer, std.testing.allocator, "title", "say \"hello\"\nnext");
+    try std.testing.expectEqualStrings("\"title\":\"say \\\"hello\\\"\\nnext\"", buf.items);
 }
 
 test "script/inject accepts POST body" {
