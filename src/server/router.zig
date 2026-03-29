@@ -398,19 +398,10 @@ fn handleNavigate(request: *std.http.Server.Request, arena: std.mem.Allocator, b
             if (rec.isRecording()) {
                 // Wait briefly for network events to start arriving
                 std.Thread.sleep(1500 * std.time.ns_per_ms);
-                if (client.ws) |*ws| {
-                    const short_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-                    const orig_timeout = std.posix.timeval{ .sec = 10, .usec = 0 };
-                    std.posix.setsockopt(ws.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&short_timeout)) catch {};
-                    var drained: u32 = 0;
-                    while (drained < 500) : (drained += 1) {
-                        const msg = ws.receiveMessageAlloc(arena, 2 * 1024 * 1024) catch break;
-                        rec.handleCdpEvent(msg);
-                        client.event_buf.push(msg);
-                    }
-                    std.log.info("navigate: drained {d} events after navigation", .{drained});
-                    std.posix.setsockopt(ws.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&orig_timeout)) catch {};
-                }
+                // Drain WS under the mutex so we don't race with send()
+                client.drainWsEvents(arena, 2);
+                // Feed all buffered events to the HAR recorder
+                flushEventsToHar(client, rec);
             }
         }
 
@@ -1159,36 +1150,53 @@ fn handleHarStop(request: *std.http.Server.Request, arena: std.mem.Allocator, br
         // First: flush any events already buffered from prior send() calls
         flushEventsToHar(client, rec);
 
-        // Second: aggressively drain the WebSocket for any remaining async events.
-        // Use a 2s timeout to catch late-arriving Network events.
-        if (client.ws) |*ws| {
-            const drain_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-            const orig_timeout = std.posix.timeval{ .sec = 10, .usec = 0 };
-            std.posix.setsockopt(ws.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&drain_timeout)) catch {};
+        // Second: drain the WebSocket under the mutex for late-arriving events.
+        client.drainWsEvents(arena, 2);
+        flushEventsToHar(client, rec);
+        std.log.info("HAR stop: recorder has {d} entries after drain", .{rec.entryCount()});
 
-            var flush_read: u32 = 0;
-            while (flush_read < 500) : (flush_read += 1) {
-                const msg = ws.receiveMessageAlloc(arena, 2 * 1024 * 1024) catch break;
-                rec.handleCdpEvent(msg);
-                client.event_buf.push(msg);
+        // Fetch response bodies BEFORE Network.disable — Chrome needs Network enabled
+        var bodies_fetched: usize = 0;
+        for (rec.entries.items) |*entry| {
+            if (entry.response_body != null) continue;
+            if (entry.status < 200 or entry.status >= 400) continue;
+            if (std.mem.indexOf(u8, entry.mime_type, "json") == null and
+                std.mem.indexOf(u8, entry.mime_type, "text/html") == null and
+                std.mem.indexOf(u8, entry.mime_type, "text/plain") == null) continue;
+            if (std.mem.endsWith(u8, entry.url, ".js") or std.mem.endsWith(u8, entry.url, ".css")) continue;
+
+            const body_params = std.fmt.allocPrint(arena, "{{\"requestId\":\"{s}\"}}", .{entry.request_id}) catch continue;
+            const body_response = client.send(arena, "Network.getResponseBody", body_params) catch continue;
+            // Extract "body":"..." handling escaped quotes inside the value
+            if (std.mem.indexOf(u8, body_response, "\"body\":\"")) |body_start| {
+                const val_start = body_start + 8; // skip "body":"
+                // Find closing " that isn't escaped
+                var pos: usize = val_start;
+                while (pos < body_response.len) : (pos += 1) {
+                    if (body_response[pos] == '\\') {
+                        pos += 1; // skip escaped char
+                        continue;
+                    }
+                    if (body_response[pos] == '"') break;
+                }
+                if (pos < body_response.len) {
+                    const body_text = body_response[val_start..pos];
+                    entry.response_body = rec.allocator.dupe(u8, body_text) catch null;
+                    if (entry.response_body != null) bodies_fetched += 1;
+                }
             }
-            std.log.info("HAR stop: drained {d} WS messages, recorder has {d} entries", .{ flush_read, rec.entryCount() });
-
-            std.posix.setsockopt(ws.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&orig_timeout)) catch {};
         }
+        if (bodies_fetched > 0) std.log.info("HAR: fetched {d} response bodies", .{bodies_fetched});
 
-        // Third: stop recording (sends Network.disable).
-        // handleCdpEvent still processes events after recording=false.
+        // Now stop recording (sends Network.disable)
         const har_json = rec.stop(client) catch {
             resp.sendError(request, 500, "Failed to generate HAR");
             return;
         };
 
-        // Fourth: flush events buffered during the Network.disable send()
+        // Flush any events buffered during Network.disable
         flushEventsToHar(client, rec);
-
         defer rec.allocator.free(har_json);
-        // Re-serialize since we may have added entries after stop
         const final_json = rec.toJson() catch {
             resp.sendError(request, 500, "Failed to generate HAR");
             return;
@@ -1216,17 +1224,17 @@ fn handleHarStop(request: *std.http.Server.Request, arena: std.mem.Allocator, br
 
 /// Feed all buffered CDP events from the client's event buffer to the HAR recorder.
 fn flushEventsToHar(client: *CdpClient, rec: *HarRecorder) void {
-    std.log.info("HAR flush: {d} buffered events", .{client.event_buf.len});
+    std.log.info("HAR flush: {d} buffered events", .{client.event_buf.items.items.len});
     var network_events: usize = 0;
-    for (client.event_buf.items[0..client.event_buf.len]) |item| {
-        if (item) |ev| {
-            if (std.mem.indexOf(u8, ev, "Network.") != null) {
-                network_events += 1;
-            }
-            rec.handleCdpEvent(ev);
+    for (client.event_buf.items.items) |ev| {
+        if (std.mem.indexOf(u8, ev, "Network.") != null) {
+            network_events += 1;
         }
+        rec.handleCdpEvent(ev);
     }
     std.log.info("HAR flush: {d} network events fed to recorder", .{network_events});
+    // Clear buffer without freeing — events were allocated by arena or different allocator
+    client.event_buf.items.clearRetainingCapacity();
 }
 
 fn handleHarStatus(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge) void {

@@ -219,21 +219,27 @@ pub const Bridge = struct {
         defer self.mu.unlock();
 
         if (self.cdp_clients.get(tab_id)) |client| {
+            std.log.info("getCdpClient: reusing existing client for tab {s}, connected={}, ws={s}", .{ tab_id, client.connected, if (client.ws != null) "present" else "null" });
             return client;
         }
 
         const tab = self.tabs.get(tab_id) orelse return null;
         if (tab.ws_url.len == 0) return null;
-
+        std.log.info("getCdpClient: creating NEW client for tab {s}, ws_url={s}", .{ tab_id, tab.ws_url });
         const client = self.allocator.create(CdpClient) catch return null;
         client.* = CdpClient.init(self.allocator, tab.ws_url);
-        self.cdp_clients.put(tab_id, client) catch {
+        // Dupe the key so it outlives the request arena
+        const owned_key = self.allocator.dupe(u8, tab_id) catch {
+            self.allocator.destroy(client);
+            return null;
+        };
+        self.cdp_clients.put(owned_key, client) catch {
+            self.allocator.free(owned_key);
             self.allocator.destroy(client);
             return null;
         };
         return client;
     }
-
     pub fn exportState(self: *Bridge, allocator: std.mem.Allocator) ![]const u8 {
         self.mu.lockShared();
         defer self.mu.unlockShared();
@@ -307,7 +313,12 @@ pub const Bridge = struct {
 
         const rec = self.allocator.create(HarRecorder) catch return null;
         rec.* = HarRecorder.init(self.allocator);
-        self.har_recorders.put(tab_id, rec) catch {
+        const owned_key = self.allocator.dupe(u8, tab_id) catch {
+            self.allocator.destroy(rec);
+            return null;
+        };
+        self.har_recorders.put(owned_key, rec) catch {
+            self.allocator.free(owned_key);
             self.allocator.destroy(rec);
             return null;
         };
