@@ -3,53 +3,51 @@ const protocol = @import("protocol.zig");
 const WebSocketClient = @import("websocket.zig").WebSocketClient;
 
 pub const EventBuffer = struct {
-    items: [32]?[]const u8,
-    len: usize,
+    items: std.ArrayListUnmanaged([]const u8),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) EventBuffer {
         return .{
-            .items = .{null} ** 32,
-            .len = 0,
+            .items = .empty,
             .allocator = allocator,
         };
     }
 
     pub fn push(self: *EventBuffer, event: []const u8) void {
-        if (self.len < 32) {
-            self.items[self.len] = event;
-            self.len += 1;
-        } else {
-            // Ring buffer: overwrite oldest
-            self.allocator.free(self.items[0].?);
-            var i: usize = 0;
-            while (i < 31) : (i += 1) {
-                self.items[i] = self.items[i + 1];
-            }
-            self.items[31] = event;
-        }
+        self.items.append(self.allocator, event) catch {
+            // If allocation fails, free the event to avoid leaking
+            self.allocator.free(event);
+        };
     }
 
     /// Check if any buffered event matches a CDP method name exactly.
     pub fn hasEvent(self: *EventBuffer, method: []const u8) bool {
-        for (self.items[0..self.len]) |item| {
-            if (item) |ev| {
-                if (eventMatchesMethod(ev, method)) return true;
-            }
+        for (self.items.items) |ev| {
+            if (eventMatchesMethod(ev, method)) return true;
         }
         return false;
     }
 
-    /// Drain all events, freeing memory.
+    /// Drain all events, freeing memory. Returns nothing.
     pub fn drain(self: *EventBuffer) void {
-        for (self.items[0..self.len]) |item| {
-            if (item) |ev| self.allocator.free(ev);
+        for (self.items.items) |ev| {
+            self.allocator.free(ev);
         }
-        self.len = 0;
+        self.items.clearRetainingCapacity();
+    }
+
+    /// Drain all events, returning them to the caller (caller owns the slice).
+    /// The EventBuffer's internal list is cleared but the event strings are NOT freed.
+    pub fn drainToSlice(self: *EventBuffer, allocator: std.mem.Allocator) [][]const u8 {
+        const slice = allocator.alloc([]const u8, self.items.items.len) catch return &.{};
+        @memcpy(slice, self.items.items);
+        self.items.clearRetainingCapacity();
+        return slice;
     }
 
     pub fn deinit(self: *EventBuffer) void {
         self.drain();
+        self.items.deinit(self.allocator);
     }
 };
 
@@ -198,6 +196,29 @@ pub const CdpClient = struct {
         return false;
     }
 
+    /// Drain pending WS events under the mutex. Sets a short read timeout,
+    /// reads all available messages into event_buf, then restores the timeout.
+    /// Call this before reading event_buf to capture late-arriving events.
+    pub fn drainWsEvents(self: *CdpClient, allocator: std.mem.Allocator, timeout_sec: i32) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        var ws = &(self.ws orelse return);
+
+        const drain_timeout = std.posix.timeval{ .sec = timeout_sec, .usec = 0 };
+        const orig_timeout = std.posix.timeval{ .sec = 10, .usec = 0 };
+        std.posix.setsockopt(ws.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&drain_timeout)) catch {};
+
+        var drained: u32 = 0;
+        while (drained < 2000) : (drained += 1) {
+            const msg = ws.receiveMessageAlloc(allocator, 2 * 1024 * 1024) catch break;
+            self.event_buf.push(msg);
+        }
+
+        std.posix.setsockopt(ws.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&orig_timeout)) catch {};
+        std.log.info("drainWsEvents: read {d} messages, buffer now {d}", .{ drained, self.event_buf.items.items.len });
+    }
+
     pub fn deinit(self: *CdpClient) void {
         self.event_buf.deinit();
         self.disconnect();
@@ -250,7 +271,7 @@ test "EventBuffer push and hasEvent" {
 
     const event = try std.testing.allocator.dupe(u8, "{\"method\":\"Page.loadEventFired\",\"params\":{}}");
     buf.push(event);
-    try std.testing.expectEqual(@as(usize, 1), buf.len);
+    try std.testing.expectEqual(@as(usize, 1), buf.items.items.len);
     try std.testing.expect(buf.hasEvent("Page.loadEventFired"));
     try std.testing.expect(!buf.hasEvent("Network.responseReceived"));
 }
@@ -263,7 +284,7 @@ test "EventBuffer drain frees all" {
     const e2 = try std.testing.allocator.dupe(u8, "event2");
     buf.push(e1);
     buf.push(e2);
-    try std.testing.expectEqual(@as(usize, 2), buf.len);
+    try std.testing.expectEqual(@as(usize, 2), buf.items.items.len);
     buf.drain();
-    try std.testing.expectEqual(@as(usize, 0), buf.len);
+    try std.testing.expectEqual(@as(usize, 0), buf.items.items.len);
 }

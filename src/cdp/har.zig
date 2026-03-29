@@ -33,6 +33,8 @@ pub const HarRecorder = struct {
         duration_ms: i64,
         request_size: usize,
         response_size: usize,
+        request_id: []const u8,
+        response_body: ?[]const u8,
     };
 
     pub fn init(allocator: std.mem.Allocator) HarRecorder {
@@ -94,6 +96,8 @@ pub const HarRecorder = struct {
         errdefer self.allocator.free(owned_status_text);
         const owned_mime_type = try self.allocator.dupe(u8, entry.mime_type);
         errdefer self.allocator.free(owned_mime_type);
+        const owned_request_id = try self.allocator.dupe(u8, entry.request_id);
+        errdefer self.allocator.free(owned_request_id);
         const owned = HarEntry{
             .url = owned_url,
             .method = owned_method,
@@ -104,16 +108,19 @@ pub const HarRecorder = struct {
             .duration_ms = entry.duration_ms,
             .request_size = entry.request_size,
             .response_size = entry.response_size,
+            .request_id = owned_request_id,
+            .response_body = null,
         };
         try self.entries.append(self.allocator, owned);
     }
 
     /// Stop recording and return the HAR as a JSON string.
     pub fn stop(self: *HarRecorder, client: *CdpClient) ![]const u8 {
-        self.recording = false;
-
-        // Disable Network domain
+        // Disable Network domain first, while still recording so buffered
+        // events from the send() call can be processed by handleCdpEvent.
         _ = client.send(self.allocator, "Network.disable", null) catch {};
+
+        self.recording = false;
 
         return self.toJson();
     }
@@ -130,7 +137,7 @@ pub const HarRecorder = struct {
             try w.print(
                 "{{\"startedDateTime\":\"{d}\",\"time\":{d}," ++
                     "\"request\":{{\"method\":\"{s}\",\"url\":\"{s}\",\"bodySize\":{d}}}," ++
-                    "\"response\":{{\"status\":{d},\"statusText\":\"{s}\",\"content\":{{\"mimeType\":\"{s}\",\"size\":{d}}}}}}}",
+                    "\"response\":{{\"status\":{d},\"statusText\":\"{s}\",\"content\":{{\"mimeType\":\"{s}\",\"size\":{d}",
                 .{
                     entry.timestamp,
                     entry.duration_ms,
@@ -143,6 +150,13 @@ pub const HarRecorder = struct {
                     entry.response_size,
                 },
             );
+            if (entry.response_body) |body| {
+                // Body from extractSimpleJsonString is already JSON-escaped
+                try w.writeAll(",\"text\":\"");
+                try w.writeAll(body);
+                try w.writeAll("\"");
+            }
+            try w.writeAll("}}}");
         }
 
         try w.writeAll("]}}");
@@ -225,6 +239,8 @@ pub const HarRecorder = struct {
                 .duration_ms = std.time.timestamp() - pending.timestamp,
                 .request_size = 0,
                 .response_size = 0,
+                .request_id = request_id,
+                .response_body = null,
             }) catch return;
         }
     }
@@ -252,6 +268,8 @@ pub const HarRecorder = struct {
             self.allocator.free(entry.method);
             self.allocator.free(entry.status_text);
             self.allocator.free(entry.mime_type);
+            self.allocator.free(entry.request_id);
+            if (entry.response_body) |body| self.allocator.free(body);
         }
         self.entries.deinit(self.allocator);
 
