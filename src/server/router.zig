@@ -4225,7 +4225,9 @@ fn handleAuthExtract(request: *std.http.Server.Request, arena: std.mem.Allocator
 
     var child = std.process.Child.init(&.{ "/bin/sh", "-c", query }, arena);
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    // Ignore stderr — if sqlite3 writes errors to stderr and nothing reads it,
+    // the pipe buffer fills up and the child blocks, causing a deadlock/120s hang.
+    child.stderr_behavior = .Ignore;
     child.spawn() catch {
         resp.sendError(request, 500, "Failed to run sqlite3 — is it installed?");
         return;
