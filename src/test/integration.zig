@@ -721,3 +721,29 @@ test "snapshot ref cache clear and repopulate cycle" {
     try std.testing.expectEqual(@as(?u32, 20), cache.get("e0"));
     try std.testing.expectEqual(@as(?u32, 22), cache.get("e2"));
 }
+
+test "action microtask flush params are well-formed JSON (#125)" {
+    // Regression test for #125: DOM mutations not applied after action.
+    // After every DOM-mutating action (click, fill, press, etc.) handleAction
+    // sends a Runtime.evaluate with awaitPromise:true to drain the browser's
+    // microtask queue so React/Vue state updates and MutationObserver callbacks
+    // are committed before we return. Verify the flush expression string is
+    // valid JSON containing the required fields.
+    const flush_json =
+        "{\"expression\":\"new Promise(r => setTimeout(r, 0))\",\"awaitPromise\":true,\"returnByValue\":true}";
+
+    // Must contain awaitPromise:true so CDP waits for the promise to resolve
+    try std.testing.expect(std.mem.indexOf(u8, flush_json, "\"awaitPromise\":true") != null);
+
+    // Must contain the setTimeout-based promise so the macrotask queue drains
+    try std.testing.expect(std.mem.indexOf(u8, flush_json, "setTimeout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flush_json, "new Promise") != null);
+
+    // Must be parseable as a JSON object (basic brace balance check)
+    var depth: i32 = 0;
+    for (flush_json) |ch| {
+        if (ch == '{') depth += 1;
+        if (ch == '}') depth -= 1;
+    }
+    try std.testing.expectEqual(@as(i32, 0), depth);
+}

@@ -628,14 +628,47 @@ fn handleAction(request: *std.http.Server.Request, arena: std.mem.Allocator, bri
             resp.sendError(request, 400, "Missing value parameter for press");
             return;
         };
-        const params = std.fmt.allocPrint(arena, "{{\"expression\":\"document.dispatchEvent(new KeyboardEvent('keydown', {{key: '{s}'}})) || 'pressed'\",\"returnByValue\":true}}", .{v}) catch {
+        // Focus the target element first so key events reach the right element
+        if (node_id) |bid| {
+            const resolve_params = std.fmt.allocPrint(arena, "{{\"backendNodeId\":{d}}}", .{bid}) catch {
+                resp.sendError(request, 500, "Internal Server Error");
+                return;
+            };
+            const resolve_response = client.send(arena, protocol.Methods.dom_resolve_node, resolve_params) catch {
+                resp.sendError(request, 502, "DOM.resolveNode failed");
+                return;
+            };
+            if (extractSimpleJsonString(resolve_response, 0, "\"objectId\"")) |obj_id| {
+                const focus_params = std.fmt.allocPrint(arena, "{{\"objectId\":\"{s}\",\"functionDeclaration\":\"function() {{ this.focus(); }}\",\"returnByValue\":true}}", .{obj_id}) catch {
+                    resp.sendError(request, 500, "Internal Server Error");
+                    return;
+                };
+                _ = client.send(arena, protocol.Methods.runtime_call_function_on, focus_params) catch {};
+            }
+        }
+        // Use CDP Input.dispatchKeyEvent for native key processing
+        // (Enter submits forms, Escape closes dialogs, Tab moves focus, etc.)
+        // Only include "text" for single printable characters; special keys use empty text.
+        const key_text = if (v.len == 1 and v[0] >= 0x20 and v[0] < 0x7f) v else "";
+        const down_params = std.fmt.allocPrint(arena, "{{\"type\":\"keyDown\",\"key\":\"{s}\",\"text\":\"{s}\",\"unmodifiedText\":\"{s}\"}}", .{ v, key_text, key_text }) catch {
             resp.sendError(request, 500, "Internal Server Error");
             return;
         };
-        const response = client.send(arena, protocol.Methods.runtime_evaluate, params) catch {
+        _ = client.send(arena, protocol.Methods.input_dispatch_key_event, down_params) catch {
             resp.sendError(request, 502, "CDP command failed");
             return;
         };
+        const up_params = std.fmt.allocPrint(arena, "{{\"type\":\"keyUp\",\"key\":\"{s}\"}}", .{v}) catch {
+            resp.sendError(request, 500, "Internal Server Error");
+            return;
+        };
+        const response = client.send(arena, protocol.Methods.input_dispatch_key_event, up_params) catch {
+            resp.sendError(request, 502, "CDP command failed");
+            return;
+        };
+        // Flush microtasks so DOM mutations from key events are applied before responding
+        _ = client.send(arena, protocol.Methods.runtime_evaluate,
+            "{\"expression\":\"new Promise(r => setTimeout(r, 0))\",\"awaitPromise\":true,\"returnByValue\":true}") catch {};
         resp.sendJson(request, response);
         return;
     }
@@ -709,10 +742,21 @@ fn handleAction(request: *std.http.Server.Request, arena: std.mem.Allocator, bri
                     resp.sendError(request, 502, "Runtime.callFunctionOn failed");
                     return;
                 };
+                // Flush microtasks so DOM mutations from the fill are applied before responding
+                _ = client.send(arena, protocol.Methods.runtime_evaluate,
+                    "{\"expression\":\"new Promise(r => setTimeout(r, 0))\",\"awaitPromise\":true,\"returnByValue\":true}") catch {};
+                // Flush network events from the fill action
+                if (bridge.getHarRecorder(tab_id)) |rec| {
+                    if (rec.isRecording()) {
+                        flushEventsToHar(arena, client, rec);
+                    }
+                }
                 resp.sendJson(request, change_response);
                 return;
             }
-            const fn_str = std.fmt.allocPrint(arena, "function() {{ this.focus(); this.value = '{s}'; this.dispatchEvent(new Event('input', {{bubbles:true}})); return 'filled'; }}", .{v}) catch {
+            // Use nativeInputValueSetter to bypass React/Vue controlled input overrides,
+            // then dispatch input + change events so frameworks detect the mutation.
+            const fn_str = std.fmt.allocPrint(arena, "function() {{ this.focus(); var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value') || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value'); if (nativeSetter && nativeSetter.set) {{ nativeSetter.set.call(this, '{s}'); }} else {{ this.value = '{s}'; }} this.dispatchEvent(new Event('input', {{bubbles:true}})); this.dispatchEvent(new Event('change', {{bubbles:true}})); return 'filled'; }}", .{ v, v }) catch {
                 resp.sendError(request, 500, "Internal Server Error");
                 return;
             };
@@ -723,7 +767,7 @@ fn handleAction(request: *std.http.Server.Request, arena: std.mem.Allocator, bri
                 resp.sendError(request, 400, "Missing value parameter for select");
                 return;
             };
-            const fn_str = std.fmt.allocPrint(arena, "function() {{ this.value = '{s}'; this.dispatchEvent(new Event('change', {{bubbles:true}})); return 'selected'; }}", .{v}) catch {
+            const fn_str = std.fmt.allocPrint(arena, "function() {{ this.value = '{s}'; this.dispatchEvent(new Event('input', {{bubbles:true}})); this.dispatchEvent(new Event('change', {{bubbles:true}})); return 'selected'; }}", .{v}) catch {
                 resp.sendError(request, 500, "Internal Server Error");
                 return;
             };
@@ -741,6 +785,20 @@ fn handleAction(request: *std.http.Server.Request, arena: std.mem.Allocator, bri
         resp.sendError(request, 502, "Runtime.callFunctionOn failed");
         return;
     };
+
+    // Flush microtasks so DOM mutations triggered by the action (React/Vue state
+    // updates, MutationObserver callbacks) are fully applied before we respond.
+    // Without this, a subsequent /snapshot call reads stale DOM (#125).
+    _ = client.send(arena, protocol.Methods.runtime_evaluate,
+        "{\"expression\":\"new Promise(r => setTimeout(r, 0))\",\"awaitPromise\":true,\"returnByValue\":true}") catch {};
+
+    // Flush network events triggered by the action (clicks often trigger XHR/fetch)
+    if (bridge.getHarRecorder(tab_id)) |rec| {
+        if (rec.isRecording()) {
+            flushEventsToHar(arena, client, rec);
+        }
+    }
+
     resp.sendJson(request, call_response);
 }
 
