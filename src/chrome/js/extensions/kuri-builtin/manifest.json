@@ -5,6 +5,7 @@
   "description": "Built-in extension for Kuri browser automation — stealth, agent comms, network observation.",
   "permissions": [
     "activeTab",
+    "tabs",
     "scripting",
     "webRequest",
     "cookies",
@@ -19,6 +20,12 @@
       "js": ["content.js"],
       "run_at": "document_start",
       "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["relay.js"],
+      "run_at": "document_start",
       "all_frames": true
     }
   ],

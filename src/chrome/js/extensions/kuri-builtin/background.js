@@ -25,7 +25,7 @@ chrome.webRequest.onSendHeaders.addListener(
         }
     },
     { urls: ['<all_urls>'] },
-    ['requestHeaders']
+    ['requestHeaders', 'extraHeaders']
 );
 
 chrome.webRequest.onHeadersReceived.addListener(
@@ -81,11 +81,31 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
 });
 
-// Cap memory — evict completed entries older than 5 minutes
+// Push completed entries to content scripts every 2s
+setInterval(() => {
+    const completed = [];
+    for (const [id, entry] of requests) {
+        if (entry.completed) {
+            completed.push({ requestId: id, ...entry });
+            requests.delete(id);
+        }
+    }
+    if (completed.length === 0) return;
+    chrome.tabs.query({}, (tabs) => {
+        for (const tab of tabs) {
+            chrome.tabs.sendMessage(tab.id, {
+                type: 'kuri:networkEntries',
+                entries: completed,
+            }).catch(() => {});
+        }
+    });
+}, 2000);
+
+// Cap memory — evict stale incomplete entries older than 5 minutes
 setInterval(() => {
     const cutoff = Date.now() - 5 * 60 * 1000;
     for (const [id, entry] of requests) {
-        if (entry.completed && entry.completedAt < cutoff) {
+        if (entry.timeStamp < cutoff) {
             requests.delete(id);
         }
     }
