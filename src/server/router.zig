@@ -188,6 +188,8 @@ fn route(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *B
         handleHeaders(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/script/inject")) {
         handleScriptInject(request, arena, bridge);
+    } else if (std.mem.eql(u8, clean_path, "/add-init-script")) {
+        handleAddInitScript(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/stop")) {
         handleStop(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/scrollintoview")) {
@@ -2675,6 +2677,51 @@ fn handleScriptInject(request: *std.http.Server.Request, arena: std.mem.Allocato
     resp.sendJson(request, response);
 }
 
+/// POST /add-init-script — register a script to run before page JS on every navigation.
+/// Accepts JSON body: {"tab_id": "...", "script": "..."}
+/// This is the equivalent of Playwright's page.addInitScript(). Under the hood it calls
+/// Page.addScriptToEvaluateOnNewDocument so the script executes before any page JavaScript,
+/// including SSR hydration code.
+fn handleAddInitScript(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge) void {
+    const body = readRequestBody(request, arena) orelse {
+        resp.sendError(request, 400, "Missing request body");
+        return;
+    };
+    if (body.len == 0) {
+        resp.sendError(request, 400, "Empty request body");
+        return;
+    }
+
+    const tab_id = extractSimpleJsonString(body, 0, "\"tab_id\"") orelse {
+        resp.sendError(request, 400, "Missing tab_id in JSON body");
+        return;
+    };
+    const script = extractSimpleJsonString(body, 0, "\"script\"") orelse {
+        resp.sendError(request, 400, "Missing script in JSON body");
+        return;
+    };
+
+    const client = bridge.getCdpClient(tab_id) orelse {
+        resp.sendError(request, 404, "Tab not found");
+        return;
+    };
+
+    const escaped = jsonEscapeAlloc(arena, script) orelse {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
+    const params = std.fmt.allocPrint(arena,
+        "{{\"source\":\"{s}\"}}", .{escaped}) catch {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
+    const response = client.send(arena, protocol.Methods.page_add_script, params) catch {
+        resp.sendError(request, 502, "CDP command failed");
+        return;
+    };
+    resp.sendJson(request, response);
+}
+
 /// Escape a string for embedding inside a JSON string value.
 /// Handles backslash, double-quote, newlines, tabs, and control characters.
 fn jsonEscapeAlloc(allocator: std.mem.Allocator, input: []const u8) ?[]const u8 {
@@ -4305,6 +4352,7 @@ test "lightpanda parity route matching" {
         "/cookies/delete",
         "/headers",
         "/script/inject",
+        "/add-init-script",
         "/stop",
     };
     for (routes) |p| {
@@ -4524,7 +4572,7 @@ test "total endpoint count" {
         "/console", "/intercept/start", "/intercept/stop", "/intercept/requests",
         "/markdown", "/links", "/pdf",
         "/dom/query", "/dom/html",
-        "/headers", "/script/inject", "/stop",
+        "/headers", "/script/inject", "/add-init-script", "/stop",
         // Tier 1 new endpoints
         "/scrollintoview", "/drag",
         "/keyboard/type", "/keyboard/inserttext",
