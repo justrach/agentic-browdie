@@ -229,13 +229,14 @@ All endpoints return JSON. Optional auth via `KURI_SECRET` env var.
 | `GET /dom/html` | Get element HTML |
 | `GET /pdf` | Print page to PDF |
 
-### HAR Recording
+### HAR Recording & API Replay
 
 | Path | Description |
 |------|-------------|
 | `GET /har/start?tab_id=` | Start recording network traffic |
 | `GET /har/stop?tab_id=` | Stop + return HAR 1.2 JSON |
 | `GET /har/status?tab_id=` | Recording state + entry count |
+| `GET /har/replay?tab_id=&filter=api&format=all` | API map with curl/fetch/python code snippets |
 
 ### Navigation & State
 
@@ -311,6 +312,50 @@ On macOS, auth profile secrets are stored in the user Keychain. On other platfor
 | `GET /dom/attributes` | Get element attributes |
 | `GET /frames` | List frame tree |
 | `GET /network` | Inspect network state/requests |
+
+---
+
+## 🛡️ Stealth & Bot Evasion
+
+Kuri applies anti-detection patches automatically on startup — no manual config needed.
+
+### What's applied
+
+- **`Page.addScriptToEvaluateOnNewDocument`** — stealth patches run before any page JS
+- **navigator.webdriver = false** — hides automation flag at Chromium level (`--disable-blink-features=AutomationControlled`)
+- **WebGL/Canvas/AudioContext spoofing** — defeats fingerprint-based detection
+- **UA rotation** — 5 realistic Chrome/Safari/Firefox user agents
+- **chrome.csi/chrome.loadTimes** — stubs for Akamai-specific checks
+
+### Bot block detection
+
+Navigate auto-detects blocks and returns structured fallback:
+
+```bash
+curl -s "http://localhost:8080/navigate?tab_id=ABC&url=https://protected-site.com"
+# If blocked:
+# {"blocked":true,"blocker":"akamai","ref_code":"0.7d...",
+#  "fallback":{"suggestions":["Open URL directly in browser","Use KURI_PROXY"]}}
+# If ok: normal CDP response
+```
+
+Detects: **Akamai**, **Cloudflare**, **PerimeterX**, **DataDome**, generic captcha.
+
+### Proxy support
+
+```bash
+KURI_PROXY=socks5://user:pass@residential-proxy:1080 ./zig-out/bin/kuri
+KURI_PROXY=http://proxy:8080 ./zig-out/bin/kuri
+```
+
+### Tested sites
+
+| Site | Protection | Result |
+|------|-----------|--------|
+| Singapore Airlines | Akamai WAF | ✅ Bypassed (was blocked before v0.4) |
+| Shopee SG | Custom anti-fraud | ✅ Page loads, redirects to login |
+| Google Flights | None | ✅ Full interaction |
+| Booking.com | PerimeterX | ⚠️ Needs proxy |
 
 ---
 

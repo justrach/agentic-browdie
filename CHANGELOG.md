@@ -2,6 +2,39 @@
 
 All notable changes to kuri are documented here.
 
+## [0.4.0] — 2026-04-10
+
+### Stealth & Anti-Bot Evasion
+- **Enhanced stealth.js** — Added WebGL renderer spoofing (Intel Iris), canvas fingerprint noise, AudioContext timing noise, `hardwareConcurrency`/`deviceMemory` spoofing, `navigator.connection` broadband values, `chrome.csi`/`chrome.loadTimes` stubs for Akamai bypass
+- **Updated User Agents** — Chrome 131 → 135, Safari 18.2 → 18.4, Firefox 134 → 137
+- **Anti-detection Chrome flags** — `--disable-blink-features=AutomationControlled`, `--disable-infobars`, `--disable-background-networking`, `--disable-dev-shm-usage`, `--window-size=1920,1080`
+- **`--no-sandbox` Linux-only** — Removed on macOS where it's a bot detection signal (fixes #128)
+- **Auto-stealth on startup** — Stealth patches + UA rotation applied to all tabs via `Page.addScriptToEvaluateOnNewDocument` during discovery. No manual `stealth` command needed in server mode
+- **Proxy support** — `KURI_PROXY` env var passes `--proxy-server` to Chrome for residential proxy evasion. Supports `socks5://` and `http://` proxies
+
+### Bot Block Detection & Fallback
+- **Automatic bot detection** — `/navigate` now detects Akamai, Cloudflare, PerimeterX, DataDome, and generic captcha blocks after navigation
+- **Structured fallback response** — When blocked, returns `{"blocked":true,"blocker":"akamai","ref_code":"...","fallback":{"suggestions":[...],"proxy_hint":"...","bypass_difficulty":"high"}}`
+- **Bypass with `&bot_detect=false`** — Disable detection for speed-sensitive operations
+- **Successfully bypassed Singapore Airlines** — Akamai WAF now passable with stealth patches + anti-detection flags (previously returned "SIA-Maintenance Page")
+
+### HAR Replay & API Map
+- **`/har/replay` endpoint** — Transforms captured HAR entries into model-friendly code snippets (curl, fetch, Python requests)
+- **Request headers capture** — HAR now records full request headers from CDP `Network.requestWillBeSent` events
+- **POST body capture** — HAR now records `postData` from request events
+- **Filters** — `?filter=api` (JSON/XHR only), `?filter=doc` (HTML/JSON), `?filter=all`
+- **Format** — `?format=curl`, `?format=fetch`, `?format=python`, `?format=all`
+
+### Security Fixes
+- **SSRF protection (#81)** — `/navigate` now validates URLs against private IPs, localhost, cloud metadata (169.254.x.x), and non-HTTP schemes via `validator.zig`
+- **JSON injection fix (#82)** — All user-supplied values (URL, selector, key, value, name, domain, file_path) escaped via `jsonEscapeAlloc` before JSON/JS interpolation
+
+### CDP Client Stability
+- **Event buffer use-after-free fix (#83)** — `EventBuffer.push` now dupes data into persistent allocator, preventing segfaults when arena allocators are destroyed
+- **Increased event headroom** — CDP `send()` now reads up to 500 events (was 100), handling heavy SPAs like Shopee/SIA
+- **Auto-reconnect** — CDP client marks itself disconnected on WebSocket errors and reconnects on next `send()` call
+- **Stale WebSocket cleanup** — `connectWs()` closes old WebSocket before opening new connection
+
 ## [0.3.0] — 2026-03-20
 
 ### Human Copilot Mode

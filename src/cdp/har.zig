@@ -21,6 +21,8 @@ pub const HarRecorder = struct {
         url: []const u8,
         method: []const u8,
         timestamp: i64,
+        headers_json: []const u8,
+        post_data: []const u8,
     };
 
     pub const HarEntry = struct {
@@ -33,6 +35,8 @@ pub const HarRecorder = struct {
         duration_ms: i64,
         request_size: usize,
         response_size: usize,
+        request_headers: []const u8,
+        post_data: []const u8,
     };
 
     pub fn init(allocator: std.mem.Allocator) HarRecorder {
@@ -53,6 +57,8 @@ pub const HarRecorder = struct {
             self.allocator.free(entry.method);
             self.allocator.free(entry.status_text);
             self.allocator.free(entry.mime_type);
+            if (entry.request_headers.len > 0) self.allocator.free(entry.request_headers);
+            if (entry.post_data.len > 0) self.allocator.free(entry.post_data);
         }
         self.entries.clearRetainingCapacity();
 
@@ -61,6 +67,8 @@ pub const HarRecorder = struct {
             self.allocator.free(kv.key_ptr.*);
             self.allocator.free(kv.value_ptr.url);
             self.allocator.free(kv.value_ptr.method);
+            if (kv.value_ptr.headers_json.len > 0) self.allocator.free(kv.value_ptr.headers_json);
+            if (kv.value_ptr.post_data.len > 0) self.allocator.free(kv.value_ptr.post_data);
         }
         self.pending_requests.clearRetainingCapacity();
 
@@ -94,6 +102,10 @@ pub const HarRecorder = struct {
         errdefer self.allocator.free(owned_status_text);
         const owned_mime_type = try self.allocator.dupe(u8, entry.mime_type);
         errdefer self.allocator.free(owned_mime_type);
+        const owned_headers = if (entry.request_headers.len > 0) try self.allocator.dupe(u8, entry.request_headers) else "";
+        errdefer if (owned_headers.len > 0) self.allocator.free(owned_headers);
+        const owned_post = if (entry.post_data.len > 0) try self.allocator.dupe(u8, entry.post_data) else "";
+        errdefer if (owned_post.len > 0) self.allocator.free(owned_post);
         const owned = HarEntry{
             .url = owned_url,
             .method = owned_method,
@@ -104,6 +116,8 @@ pub const HarRecorder = struct {
             .duration_ms = entry.duration_ms,
             .request_size = entry.request_size,
             .response_size = entry.response_size,
+            .request_headers = owned_headers,
+            .post_data = owned_post,
         };
         try self.entries.append(self.allocator, owned);
     }
@@ -184,15 +198,25 @@ pub const HarRecorder = struct {
                 self.allocator.free(owned_url);
                 return;
             };
+            // Capture request headers JSON blob
+            const headers_json = extractHeadersObject(request_obj) orelse "";
+            const owned_headers = if (headers_json.len > 0) self.allocator.dupe(u8, headers_json) catch "" else "";
+            // Capture POST body if present
+            const post_data = extractField(request_obj, "postData") orelse "";
+            const owned_post = if (post_data.len > 0) self.allocator.dupe(u8, post_data) catch "" else "";
             const pending = PendingRequest{
                 .url = owned_url,
                 .method = owned_method,
                 .timestamp = std.time.timestamp(),
+                .headers_json = owned_headers,
+                .post_data = owned_post,
             };
             self.pending_requests.put(owned_id, pending) catch {
                 self.allocator.free(owned_id);
                 self.allocator.free(owned_url);
                 self.allocator.free(owned_method);
+                if (owned_headers.len > 0) self.allocator.free(owned_headers);
+                if (owned_post.len > 0) self.allocator.free(owned_post);
             };
         } else if (std.mem.indexOf(u8, event_json, "\"Network.responseReceived\"") != null) {
             const request_id = extractField(event_json, "requestId") orelse return;
@@ -202,6 +226,8 @@ pub const HarRecorder = struct {
                 self.allocator.free(pending_kv.key);
                 self.allocator.free(pending.url);
                 self.allocator.free(pending.method);
+                if (pending.headers_json.len > 0) self.allocator.free(pending.headers_json);
+                if (pending.post_data.len > 0) self.allocator.free(pending.post_data);
             }
 
             // Extract status and mimeType from the nested "response" object
@@ -225,8 +251,27 @@ pub const HarRecorder = struct {
                 .duration_ms = std.time.timestamp() - pending.timestamp,
                 .request_size = 0,
                 .response_size = 0,
+                .request_headers = pending.headers_json,
+                .post_data = pending.post_data,
             }) catch return;
         }
+    }
+
+    /// Extract the "headers":{...} object as a raw JSON string from a CDP request object.
+    fn extractHeadersObject(json: []const u8) ?[]const u8 {
+        const key = "\"headers\":{";
+        const key_pos = std.mem.indexOf(u8, json, key) orelse return null;
+        const obj_start = key_pos + key.len - 1; // include the {
+        var depth: usize = 0;
+        var i = obj_start;
+        while (i < json.len) : (i += 1) {
+            if (json[i] == '{') depth += 1
+            else if (json[i] == '}') {
+                depth -= 1;
+                if (depth == 0) return json[obj_start .. i + 1];
+            }
+        }
+        return null;
     }
 
     /// Extract a simple string field value from JSON: finds "field":"value" pattern.
@@ -252,6 +297,8 @@ pub const HarRecorder = struct {
             self.allocator.free(entry.method);
             self.allocator.free(entry.status_text);
             self.allocator.free(entry.mime_type);
+            if (entry.request_headers.len > 0) self.allocator.free(entry.request_headers);
+            if (entry.post_data.len > 0) self.allocator.free(entry.post_data);
         }
         self.entries.deinit(self.allocator);
 
@@ -289,6 +336,8 @@ test "HarRecorder addEntry and toJson" {
         .duration_ms = 42,
         .request_size = 0,
         .response_size = 15000,
+        .request_headers = "",
+        .post_data = "",
     });
 
     try rec.addEntry(.{
@@ -301,6 +350,8 @@ test "HarRecorder addEntry and toJson" {
         .duration_ms = 100,
         .request_size = 256,
         .response_size = 512,
+        .request_headers = "",
+        .post_data = "",
     });
 
     try std.testing.expectEqual(@as(usize, 2), rec.entryCount());
@@ -376,6 +427,8 @@ test "HarRecorder start clears stale pending requests before enabling network" {
         .url = owned_url,
         .method = owned_method,
         .timestamp = 123,
+        .headers_json = "",
+        .post_data = "",
     });
 
     rec.recording = true;

@@ -24,12 +24,17 @@ pub const EventBuffer = struct {
 
     pub fn push(self: *EventBuffer, owner: std.mem.Allocator, event: []const u8) void {
         if (self.items.items.len >= 256) {
-            const oldest = self.items.items[0];
-            oldest.owner.free(oldest.data);
+            // Drop oldest event — copy to our own allocator so we don't hold arena refs
             _ = self.items.orderedRemove(0);
         }
-        self.items.append(self.allocator, .{ .data = event, .owner = owner }) catch {
-            owner.free(event);
+        // Dupe event data into our persistent allocator so it survives arena resets
+        const duped = self.allocator.dupe(u8, event) catch {
+            return;
+        };
+        // Free the original from the caller's arena
+        owner.free(event);
+        self.items.append(self.allocator, .{ .data = duped, .owner = self.allocator }) catch {
+            self.allocator.free(duped);
         };
     }
 
@@ -98,6 +103,11 @@ pub const CdpClient = struct {
     /// Connect to Chrome CDP WebSocket endpoint.
     pub fn connectWs(self: *CdpClient) !void {
         if (self.connected) return;
+        // Close stale WebSocket if present
+        if (self.ws) |*old_ws| {
+            old_ws.close();
+            self.ws = null;
+        }
         self.ws = WebSocketClient.connect(
             self.allocator,
             self.cdp_url,
@@ -122,15 +132,27 @@ pub const CdpClient = struct {
         const msg = try self.buildMessageWithId(allocator, sent_id, method, params_json);
         defer allocator.free(msg);
 
-        ws.sendText(msg) catch return error.ConnectionRefused;
+        ws.sendText(msg) catch {
+            // Connection broke — mark disconnected so next call reconnects
+            self.connected = false;
+            return error.ConnectionRefused;
+        };
 
-        // Read responses, buffer events, max 100 attempts
-        // (needs headroom for event-heavy operations like cookies/network)
+        // Read responses, buffer events, max 500 attempts
+        // Heavy SPAs (Shopee, SIA) flood hundreds of CDP events during page load
         var attempts: u32 = 0;
-        while (attempts < 100) : (attempts += 1) {
+        while (attempts < 500) : (attempts += 1) {
             const response = ws.receiveMessageAlloc(allocator, 2 * 1024 * 1024) catch |err| switch (err) {
-                error.ConnectionClosed => return error.ConnectionRefused,
-                else => return error.ConnectionRefused,
+                error.ConnectionClosed => {
+                    self.connected = false;
+                    return error.ConnectionRefused;
+                },
+                else => {
+                    // Timeout or read error — if we've read some events, retry a few more times
+                    if (attempts > 0) continue;
+                    self.connected = false;
+                    return error.ConnectionRefused;
+                },
             };
 
             if (matchesResponseId(response, sent_id)) {

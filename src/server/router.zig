@@ -12,6 +12,7 @@ const protocol = @import("../cdp/protocol.zig");
 const HarRecorder = @import("../cdp/har.zig").HarRecorder;
 const CdpClient = @import("../cdp/client.zig").CdpClient;
 const auth_profiles = @import("../storage/auth_profiles.zig");
+const url_validator = @import("../crawler/validator.zig");
 
 pub fn run(gpa: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_port: u16) !void {
     const address = try net.Address.parseIp4(cfg.host, cfg.port);
@@ -101,7 +102,9 @@ fn route(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *B
     } else if (std.mem.eql(u8, clean_path, "/har/stop")) {
         handleHarStop(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/har/status")) {
-        handleHarStatus(request, arena, bridge);
+            handleHarStatus(request, arena, bridge);
+        } else if (std.mem.eql(u8, clean_path, "/har/replay")) {
+            handleHarReplay(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/close")) {
         handleClose(request, arena, bridge);
     } else if (std.mem.eql(u8, clean_path, "/cookies")) {
@@ -372,10 +375,28 @@ fn handleNavigate(request: *std.http.Server.Request, arena: std.mem.Allocator, b
         resp.sendError(request, 400, "Missing url parameter");
         return;
     };
+    url_validator.validateUrl(url) catch |err| {
+        const msg = switch (err) {
+            error.InvalidScheme => "URL must use http:// or https://",
+            error.PrivateIp => "Navigation to private IP addresses is blocked",
+            error.LocalhostBlocked => "Navigation to localhost is blocked",
+            error.MetadataIpBlocked => "Navigation to cloud metadata endpoints is blocked",
+            error.InvalidUrl => "Invalid URL format",
+            else => "URL validation failed",
+        };
+        resp.sendError(request, 403, msg);
+        return;
+    };
+
     const tab_id = getQueryParam(target, "tab_id");
     const cf_wait = if (getQueryParam(target, "cf_wait")) |v| std.mem.eql(u8, v, "true") else false;
     const cf_timeout_str = getQueryParam(target, "cf_timeout") orelse "15000";
     const cf_timeout_ms = std.fmt.parseInt(u64, cf_timeout_str, 10) catch 15000;
+
+    const escaped_url = jsonEscapeAlloc(arena, url) orelse {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
 
     // If we have a tab, use its CDP client
     if (tab_id) |tid| {
@@ -383,7 +404,7 @@ fn handleNavigate(request: *std.http.Server.Request, arena: std.mem.Allocator, b
             resp.sendError(request, 404, "Tab not found");
             return;
         };
-        const params = std.fmt.allocPrint(arena, "{{\"url\":\"{s}\"}}", .{url}) catch {
+        const params = std.fmt.allocPrint(arena, "{{\"url\":\"{s}\"}}", .{escaped_url}) catch {
             resp.sendError(request, 500, "Internal Server Error");
             return;
         };
@@ -400,6 +421,62 @@ fn handleNavigate(request: *std.http.Server.Request, arena: std.mem.Allocator, b
                 std.Thread.sleep(1500 * std.time.ns_per_ms);
                 client.drainWsEvents(arena, 2);
                 flushEventsToHar(arena, client, rec);
+            }
+        }
+
+        // Bot block detection — check if we got blocked and return structured fallback
+        const bot_detect = if (getQueryParam(target, "bot_detect")) |v| !std.mem.eql(u8, v, "false") else true;
+        if (bot_detect) {
+            // Wait for page to settle before checking
+            std.Thread.sleep(3000 * std.time.ns_per_ms);
+            // Detection uses BLOCKER= prefix markers so we can find them in the CDP string response
+            const detect_js = "(() => { var t = document.title || ''; var b = document.body ? document.body.innerText.substring(0, 2000) : ''; var h = document.documentElement.innerHTML.substring(0, 8000); var blocker = ''; var code = ''; if (b.indexOf('Reference error code:') !== -1 || h.indexOf('WAF_Custom_Deny') !== -1 || h.indexOf('akamai') !== -1 || (t.indexOf('Maintenance') !== -1 && b.indexOf('error code') !== -1)) { blocker = 'akamai'; var idx = b.indexOf('Reference error code:'); if (idx !== -1) { var rest = b.substring(idx + 22, idx + 80); var nl = rest.indexOf(String.fromCharCode(10)); code = nl !== -1 ? rest.substring(0, nl).trim() : rest.trim(); } } else if (t === 'Just a moment...' || h.indexOf('challenge-platform') !== -1 || h.indexOf('cf-browser-verification') !== -1 || h.indexOf('cf-chl-') !== -1) { blocker = 'cloudflare'; } else if (h.indexOf('perimeterx') !== -1 || h.indexOf('_pxCaptcha') !== -1 || h.indexOf('human-challenge') !== -1) { blocker = 'perimeterx'; } else if (h.indexOf('datadome') !== -1 || h.indexOf('DataDome') !== -1) { blocker = 'datadome'; } else if (h.indexOf('captcha') !== -1 && (t.indexOf('Access Denied') !== -1 || t.indexOf('Blocked') !== -1 || t === '')) { blocker = 'captcha'; } else if (t.indexOf('Access Denied') !== -1 || t.indexOf('403 Forbidden') !== -1 || (t === '' && b.length < 50 && h.indexOf('block') !== -1)) { blocker = 'unknown'; } if (!blocker) return 'NOBLOCK'; return 'BLOCKED|' + blocker + '|' + code + '|' + window.location.href; })()";
+            const detect_escaped = jsonEscapeAlloc(arena, detect_js) orelse {
+                resp.sendJson(request, response);
+                return;
+            };
+            const detect_params = std.fmt.allocPrint(arena, "{{\"expression\":\"{s}\",\"returnByValue\":true}}", .{detect_escaped}) catch {
+                resp.sendJson(request, response);
+                return;
+            };
+            const detect_response = client.send(arena, protocol.Methods.runtime_evaluate, detect_params) catch {
+                resp.sendJson(request, response);
+                return;
+            };
+            // Check if blocked — look for BLOCKED| marker in CDP response string value
+            if (std.mem.indexOf(u8, detect_response, "BLOCKED|") != null) {
+                // Parse "BLOCKED|blocker|code|url" from the value field
+                const marker_pos = std.mem.indexOf(u8, detect_response, "BLOCKED|").?;
+                const after_marker = detect_response[marker_pos + 8 ..];
+                // Find blocker (up to next |)
+                const blocker_end = std.mem.indexOfScalar(u8, after_marker, '|') orelse after_marker.len;
+                const blocker = after_marker[0..blocker_end];
+                // Find code (between second and third |)
+                const after_blocker = if (blocker_end < after_marker.len) after_marker[blocker_end + 1 ..] else "";
+                const code_end = std.mem.indexOfScalar(u8, after_blocker, '|') orelse after_blocker.len;
+                const ref_code_raw = after_blocker[0..code_end];
+                // Find url (after third |, up to closing quote)
+                const after_code = if (code_end < after_blocker.len) after_blocker[code_end + 1 ..] else "";
+                const url_end = std.mem.indexOfScalar(u8, after_code, '"') orelse after_code.len;
+                const final_url_val = after_code[0..url_end];
+                const ref_code = ref_code_raw;
+                const escaped_blocker = jsonEscapeAlloc(arena, blocker) orelse blocker;
+                const escaped_code = jsonEscapeAlloc(arena, ref_code) orelse "";
+                const escaped_final_url = jsonEscapeAlloc(arena, final_url_val) orelse escaped_url;
+                const blocked_body = std.fmt.allocPrint(arena,
+                    \\{{"blocked":true,"blocker":"{s}","ref_code":"{s}","url":"{s}","fallback":{{
+                    \\"direct_url":"{s}",
+                    \\"message":"This site uses {s} bot protection which blocks automated browsers at the TLS/network level. Stealth patches and JS overrides cannot bypass this.",
+                    \\"suggestions":["Open the URL directly in a real browser: {s}","Use a residential proxy (set KURI_PROXY=socks5://...) to change IP reputation","For airline check-in: use the airline's mobile app instead","Set a reminder to check in manually at the right time"],
+                    \\"proxy_hint":"KURI_PROXY=socks5://user:pass@residential-proxy:1080 or KURI_PROXY=http://proxy:8080",
+                    \\"bypass_difficulty":"high"
+                    \\}}}}
+                , .{ escaped_blocker, escaped_code, escaped_final_url, escaped_url, escaped_blocker, escaped_url }) catch {
+                    resp.sendJson(request, response);
+                    return;
+                };
+                resp.sendJson(request, blocked_body);
+                return;
             }
         }
 
@@ -445,7 +522,7 @@ fn handleNavigate(request: *std.http.Server.Request, arena: std.mem.Allocator, b
 
     // No tab specified — discover from Chrome debugging endpoint
     _ = cfg;
-    const body = std.fmt.allocPrint(arena, "{{\"status\":\"ok\",\"url\":\"{s}\",\"message\":\"Navigate requires tab_id. Use /tabs to list available tabs.\"}}", .{url}) catch {
+    const body = std.fmt.allocPrint(arena, "{{\"status\":\"ok\",\"url\":\"{s}\",\"message\":\"Navigate requires tab_id. Use /tabs to list available tabs.\"}}", .{escaped_url}) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -676,6 +753,10 @@ fn handleAction(request: *std.http.Server.Request, arena: std.mem.Allocator, bri
                 resp.sendError(request, 400, "Missing value parameter for fill/type");
                 return;
             };
+            const escaped_v = jsonEscapeAlloc(arena, v) orelse {
+                resp.sendError(request, 500, "Internal Server Error");
+                return;
+            };
             // realistic=true: use per-character key events for React/Vue compatibility
             const use_realistic = if (realistic) |r| std.mem.eql(u8, r, "true") else false;
             if (use_realistic) {
@@ -712,7 +793,7 @@ fn handleAction(request: *std.http.Server.Request, arena: std.mem.Allocator, bri
                 resp.sendJson(request, change_response);
                 return;
             }
-            const fn_str = std.fmt.allocPrint(arena, "function() {{ this.focus(); this.value = '{s}'; this.dispatchEvent(new Event('input', {{bubbles:true}})); return 'filled'; }}", .{v}) catch {
+            const fn_str = std.fmt.allocPrint(arena, "function() {{ this.focus(); this.value = '{s}'; this.dispatchEvent(new Event('input', {{bubbles:true}})); return 'filled'; }}", .{escaped_v}) catch {
                 resp.sendError(request, 500, "Internal Server Error");
                 return;
             };
@@ -723,7 +804,11 @@ fn handleAction(request: *std.http.Server.Request, arena: std.mem.Allocator, bri
                 resp.sendError(request, 400, "Missing value parameter for select");
                 return;
             };
-            const fn_str = std.fmt.allocPrint(arena, "function() {{ this.value = '{s}'; this.dispatchEvent(new Event('change', {{bubbles:true}})); return 'selected'; }}", .{v}) catch {
+            const escaped_v = jsonEscapeAlloc(arena, v) orelse {
+                resp.sendError(request, 500, "Internal Server Error");
+                return;
+            };
+            const fn_str = std.fmt.allocPrint(arena, "function() {{ this.value = '{s}'; this.dispatchEvent(new Event('change', {{bubbles:true}})); return 'selected'; }}", .{escaped_v}) catch {
                 resp.sendError(request, 500, "Internal Server Error");
                 return;
             };
@@ -918,6 +1003,23 @@ pub fn discoverTabs(arena: std.mem.Allocator, bridge: *Bridge, cfg: Config, cdp_
             };
             try bridge.putTab(entry);
             registered += 1;
+
+            // Auto-apply stealth patches to each discovered tab
+            if (bridge.getCdpClient(id_val)) |client| {
+                const stealth = @import("../cdp/stealth.zig");
+                const escaped = jsonEscapeAlloc(arena, stealth.stealth_script) orelse continue;
+                const add_params = std.fmt.allocPrint(arena, "{{\"source\":\"{s}\"}}", .{escaped}) catch continue;
+                _ = client.send(arena, protocol.Methods.page_add_script, add_params) catch {};
+
+                // Set a random user agent at network level
+                const ua = stealth.randomUserAgent();
+                const ua_escaped = jsonEscapeAlloc(arena, ua) orelse continue;
+                _ = client.send(arena, protocol.Methods.network_enable, null) catch {};
+                const ua_params = std.fmt.allocPrint(arena, "{{\"userAgent\":\"{s}\"}}", .{ua_escaped}) catch continue;
+                _ = client.send(arena, "Network.setUserAgentOverride", ua_params) catch {};
+
+                std.log.info("stealth patches applied to tab {s}", .{id_val});
+            }
         }
 
         const next_id = std.mem.indexOfPos(u8, body, id_start + 4, "\"id\"") orelse body.len;
@@ -1233,6 +1335,127 @@ fn handleHarStatus(request: *std.http.Server.Request, arena: std.mem.Allocator, 
     resp.sendJson(request, body);
 }
 
+// ── HAR Replay / Code Generation Endpoint ───────────────────────────────
+
+fn handleHarReplay(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge) void {
+    const target = request.head.target;
+    const tab_id = getQueryParam(target, "tab_id") orelse {
+        resp.sendError(request, 400, "Missing tab_id parameter");
+        return;
+    };
+    const format = getQueryParam(target, "format") orelse "all";
+    const filter = getQueryParam(target, "filter") orelse "api";
+
+    const rec = bridge.getHarRecorder(tab_id) orelse {
+        resp.sendError(request, 404, "No HAR recorder for this tab");
+        return;
+    };
+
+    if (rec.entryCount() == 0) {
+        resp.sendJson(request, "{\"entries\":0,\"message\":\"No HAR entries captured. Use /har/start, navigate, then /har/replay.\"}");
+        return;
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    const w = buf.writer(arena);
+
+    w.writeAll("{\"entries\":") catch {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
+    w.print("{d}", .{rec.entryCount()}) catch return;
+    w.writeAll(",\"api_calls\":[") catch return;
+
+    var api_count: usize = 0;
+    for (rec.entries.items) |entry| {
+        // Filter: "api" = only JSON/XHR, "all" = everything, "doc" = documents only
+        const dominated_by_api = std.mem.eql(u8, filter, "api");
+        const dominated_by_doc = std.mem.eql(u8, filter, "doc");
+        if (dominated_by_api) {
+            const is_api = std.mem.indexOf(u8, entry.mime_type, "json") != null or
+                std.mem.indexOf(u8, entry.mime_type, "xml") != null or
+                std.mem.indexOf(u8, entry.mime_type, "graphql") != null or
+                std.mem.eql(u8, entry.method, "POST") or
+                std.mem.eql(u8, entry.method, "PUT") or
+                std.mem.eql(u8, entry.method, "PATCH") or
+                std.mem.eql(u8, entry.method, "DELETE");
+            if (!is_api) continue;
+        }
+        if (dominated_by_doc) {
+            const is_doc = std.mem.indexOf(u8, entry.mime_type, "html") != null or
+                std.mem.indexOf(u8, entry.mime_type, "json") != null;
+            if (!is_doc) continue;
+        }
+
+        if (api_count > 0) w.writeAll(",") catch return;
+
+        const escaped_url_entry = jsonEscapeAlloc(arena, entry.url) orelse entry.url;
+        const escaped_method = jsonEscapeAlloc(arena, entry.method) orelse entry.method;
+        const escaped_mime = jsonEscapeAlloc(arena, entry.mime_type) orelse entry.mime_type;
+
+        // Build the entry object
+        w.writeAll("{") catch return;
+        w.print("\"method\":\"{s}\",\"url\":\"{s}\",\"status\":{d},\"mime\":\"{s}\"", .{
+            escaped_method, escaped_url_entry, entry.status, escaped_mime,
+        }) catch return;
+
+        // Include request headers and post data if present
+        if (entry.request_headers.len > 0) {
+            const escaped_hdrs = jsonEscapeAlloc(arena, entry.request_headers) orelse "";
+            w.print(",\"request_headers\":\"{s}\"", .{escaped_hdrs}) catch return;
+        }
+        if (entry.post_data.len > 0) {
+            const escaped_post = jsonEscapeAlloc(arena, entry.post_data) orelse "";
+            w.print(",\"post_data\":\"{s}\"", .{escaped_post}) catch return;
+        }
+
+        // Generate code snippets based on format
+        const want_curl = std.mem.eql(u8, format, "curl") or std.mem.eql(u8, format, "all");
+        const want_fetch = std.mem.eql(u8, format, "fetch") or std.mem.eql(u8, format, "all");
+        const want_python = std.mem.eql(u8, format, "python") or std.mem.eql(u8, format, "all");
+
+        if (want_curl) {
+            w.writeAll(",\"curl\":\"") catch return;
+            w.print("curl -X {s} '{s}'", .{ escaped_method, escaped_url_entry }) catch return;
+            w.writeAll("\"") catch return;
+        }
+        if (want_fetch) {
+            w.writeAll(",\"fetch\":\"") catch return;
+            if (std.mem.eql(u8, entry.method, "GET")) {
+                w.print("await fetch('{s}')", .{escaped_url_entry}) catch return;
+            } else {
+                w.print("await fetch('{s}', {{method: '{s}', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{}})}}))", .{ escaped_url_entry, escaped_method }) catch return;
+            }
+            w.writeAll("\"") catch return;
+        }
+        if (want_python) {
+            w.writeAll(",\"python\":\"") catch return;
+            if (std.mem.eql(u8, entry.method, "GET")) {
+                w.print("requests.get('{s}')", .{escaped_url_entry}) catch return;
+            } else {
+                w.print("requests.{s}('{s}', json={{}})", .{
+                    if (std.mem.eql(u8, entry.method, "POST")) "post" else if (std.mem.eql(u8, entry.method, "PUT")) "put" else if (std.mem.eql(u8, entry.method, "DELETE")) "delete" else "post",
+                    escaped_url_entry,
+                }) catch return;
+            }
+            w.writeAll("\"") catch return;
+        }
+
+        w.writeAll("}") catch return;
+        api_count += 1;
+    }
+
+    w.writeAll("],\"total_api_calls\":") catch return;
+    w.print("{d}", .{api_count}) catch return;
+    w.writeAll(",\"hint\":\"Use these code snippets to interact with the site's API directly. Add cookies/headers from /cookies and /headers endpoints for authenticated requests.\"}") catch return;
+
+    const result = buf.toOwnedSlice(arena) catch {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
+    resp.sendJson(request, result);
+}
+
 // ── Console Log Capture Endpoint ────────────────────────────────────────
 
 fn handleConsole(request: *std.http.Server.Request, arena: std.mem.Allocator, bridge: *Bridge) void {
@@ -1408,9 +1631,18 @@ fn handleStorage(request: *std.http.Server.Request, arena: std.mem.Allocator, br
     const key = getQueryParam(target, "key");
     const value = getQueryParam(target, "value");
 
-    const expr = if (key != null and value != null)
-        std.fmt.allocPrint(arena, "(() => {{ {s}.setItem('{s}', '{s}'); return 'stored'; }})()", .{ storage_type, key.?, value.? })
-    else if (key) |k|
+    const escaped_key = if (key) |k| (jsonEscapeAlloc(arena, k) orelse {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    }) else null;
+    const escaped_value = if (value) |v| (jsonEscapeAlloc(arena, v) orelse {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    }) else null;
+
+    const expr = if (escaped_key != null and escaped_value != null)
+        std.fmt.allocPrint(arena, "(() => {{ {s}.setItem('{s}', '{s}'); return 'stored'; }})()", .{ storage_type, escaped_key.?, escaped_value.? })
+    else if (escaped_key) |k|
         std.fmt.allocPrint(arena, "{s}.getItem('{s}')", .{ storage_type, k })
     else
         std.fmt.allocPrint(arena, "JSON.stringify(Object.fromEntries(Object.entries({s})))", .{storage_type});
@@ -1463,23 +1695,25 @@ fn buildGetExpression(arena: std.mem.Allocator, query_type: []const u8, selector
         return std.fmt.allocPrint(arena, "window.location.href", .{}) catch return null;
 
     const sel = selector orelse return null;
+    const escaped_sel = jsonEscapeAlloc(arena, sel) orelse return null;
 
     if (std.mem.eql(u8, query_type, "html"))
-        return std.fmt.allocPrint(arena, "document.querySelector('{s}')?.innerHTML || null", .{sel}) catch return null;
+        return std.fmt.allocPrint(arena, "document.querySelector('{s}')?.innerHTML || null", .{escaped_sel}) catch return null;
     if (std.mem.eql(u8, query_type, "value"))
-        return std.fmt.allocPrint(arena, "document.querySelector('{s}')?.value || null", .{sel}) catch return null;
+        return std.fmt.allocPrint(arena, "document.querySelector('{s}')?.value || null", .{escaped_sel}) catch return null;
     if (std.mem.eql(u8, query_type, "text"))
-        return std.fmt.allocPrint(arena, "document.querySelector('{s}')?.innerText || null", .{sel}) catch return null;
+        return std.fmt.allocPrint(arena, "document.querySelector('{s}')?.innerText || null", .{escaped_sel}) catch return null;
     if (std.mem.eql(u8, query_type, "attr")) {
         const a = attr_name orelse return null;
-        return std.fmt.allocPrint(arena, "document.querySelector('{s}')?.getAttribute('{s}') || null", .{ sel, a }) catch return null;
+        const escaped_a = jsonEscapeAlloc(arena, a) orelse return null;
+        return std.fmt.allocPrint(arena, "document.querySelector('{s}')?.getAttribute('{s}') || null", .{ escaped_sel, escaped_a }) catch return null;
     }
     if (std.mem.eql(u8, query_type, "count"))
-        return std.fmt.allocPrint(arena, "document.querySelectorAll('{s}').length", .{sel}) catch return null;
+        return std.fmt.allocPrint(arena, "document.querySelectorAll('{s}').length", .{escaped_sel}) catch return null;
     if (std.mem.eql(u8, query_type, "box"))
-        return std.fmt.allocPrint(arena, "JSON.stringify(document.querySelector('{s}')?.getBoundingClientRect())", .{sel}) catch return null;
+        return std.fmt.allocPrint(arena, "JSON.stringify(document.querySelector('{s}')?.getBoundingClientRect())", .{escaped_sel}) catch return null;
     if (std.mem.eql(u8, query_type, "styles"))
-        return std.fmt.allocPrint(arena, "JSON.stringify(Object.fromEntries([...window.getComputedStyle(document.querySelector('{s}'))].map(k => [k, window.getComputedStyle(document.querySelector('{s}'))[k]])))", .{ sel, sel }) catch return null;
+        return std.fmt.allocPrint(arena, "JSON.stringify(Object.fromEntries([...window.getComputedStyle(document.querySelector('{s}'))].map(k => [k, window.getComputedStyle(document.querySelector('{s}'))[k]])))", .{ escaped_sel, escaped_sel }) catch return null;
 
     return null;
 }
@@ -1785,7 +2019,11 @@ fn handleUpload(request: *std.http.Server.Request, arena: std.mem.Allocator, bri
     };
 
     // Send DOM.setFileInputFiles with the resolved backendNodeId
-    const params = std.fmt.allocPrint(arena, "{{\"files\":[\"{s}\"],\"backendNodeId\":{d}}}", .{ file_path, bid }) catch {
+    const escaped_file_path = jsonEscapeAlloc(arena, file_path) orelse {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
+    const params = std.fmt.allocPrint(arena, "{{\"files\":[\"{s}\"],\"backendNodeId\":{d}}}", .{ escaped_file_path, bid }) catch {
         resp.sendError(request, 500, "Internal Server Error");
         return;
     };
@@ -2573,11 +2811,19 @@ fn handleCookiesDelete(request: *std.http.Server.Request, arena: std.mem.Allocat
         return;
     };
 
+    const escaped_name = jsonEscapeAlloc(arena, name) orelse {
+        resp.sendError(request, 500, "Internal Server Error");
+        return;
+    };
     const domain = getQueryParam(target, "domain");
-    const params = if (domain) |d|
-        std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"domain\":\"{s}\"}}", .{ name, d })
-    else
-        std.fmt.allocPrint(arena, "{{\"name\":\"{s}\"}}", .{name});
+    const params = if (domain) |d| blk: {
+        const escaped_domain = jsonEscapeAlloc(arena, d) orelse {
+            resp.sendError(request, 500, "Internal Server Error");
+            return;
+        };
+        break :blk std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"domain\":\"{s}\"}}", .{ escaped_name, escaped_domain });
+    } else
+        std.fmt.allocPrint(arena, "{{\"name\":\"{s}\"}}", .{escaped_name});
 
     const delete_params = params catch {
         resp.sendError(request, 500, "Internal Server Error");

@@ -114,6 +114,7 @@ test "discoverTabs hydrates bridge from Chrome target list" {
         .navigate_timeout_ms = 30_000,
         .extensions = null,
         .headless = true,
+        .proxy = null,
     };
 
     var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);

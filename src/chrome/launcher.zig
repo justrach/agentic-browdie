@@ -14,6 +14,7 @@ pub const Launcher = struct {
     mode: Mode,
     extensions: ?[]const u8,
     headless: bool,
+    proxy: ?[]const u8,
 
     pub const Mode = enum {
         managed, // we launched Chrome ourselves
@@ -66,6 +67,7 @@ pub const Launcher = struct {
             .mode = mode,
             .extensions = cfg.extensions,
             .headless = cfg.headless,
+            .proxy = cfg.proxy,
         };
     }
 
@@ -120,8 +122,22 @@ pub const Launcher = struct {
             const data_dir = try std.fmt.allocPrint(self.allocator, "--user-data-dir={s}/.kuri/chrome-profile", .{home});
             try argv_list.append(self.allocator, data_dir);
         }
-        try argv_list.append(self.allocator, "--no-sandbox");
+        // Only use --no-sandbox on Linux (needed for containers), it's a detection signal on macOS
+        if (@import("builtin").os.tag == .linux) {
+            try argv_list.append(self.allocator, "--no-sandbox");
+        }
         try argv_list.append(self.allocator, "--remote-allow-origins=*");
+        try argv_list.append(self.allocator, "--disable-blink-features=AutomationControlled");
+        try argv_list.append(self.allocator, "--disable-infobars");
+        try argv_list.append(self.allocator, "--disable-background-networking");
+        try argv_list.append(self.allocator, "--disable-dev-shm-usage");
+        try argv_list.append(self.allocator, "--window-size=1920,1080");
+
+        if (self.proxy) |proxy_url| {
+            const proxy_flag = try std.fmt.allocPrint(self.allocator, "--proxy-server={s}", .{proxy_url});
+            try argv_list.append(self.allocator, proxy_flag);
+        }
+
         try argv_list.append(self.allocator, port_flag);
 
         // Build and append extension flags if configured
@@ -159,6 +175,15 @@ pub const Launcher = struct {
         if (ext_flags) |flags| {
             for (flags) |f| self.allocator.free(f);
             self.allocator.free(flags);
+        }
+        // Free proxy flag if allocated
+        if (self.proxy) |_| {
+            for (argv_list.items) |item| {
+                if (std.mem.startsWith(u8, item, "--proxy-server=")) {
+                    self.allocator.free(item);
+                    break;
+                }
+            }
         }
 
         std.log.info("launched Chrome (pid={d}) on CDP port {d}", .{
@@ -500,6 +525,7 @@ test "Launcher init managed mode" {
         .navigate_timeout_ms = 30_000,
         .extensions = null,
         .headless = true,
+        .proxy = null,
     };
     const launcher = Launcher.init(std.testing.allocator, cfg);
     try std.testing.expectEqual(Launcher.Mode.managed, launcher.mode);
@@ -518,6 +544,7 @@ test "Launcher init external mode" {
         .navigate_timeout_ms = 30_000,
         .extensions = null,
         .headless = true,
+        .proxy = null,
     };
     const launcher = Launcher.init(std.testing.allocator, cfg);
     try std.testing.expectEqual(Launcher.Mode.external, launcher.mode);
@@ -535,6 +562,7 @@ test "Launcher init with extensions" {
         .navigate_timeout_ms = 30_000,
         .extensions = "/path/to/ext1,/path/to/ext2",
         .headless = true,
+        .proxy = null,
     };
     const launcher = Launcher.init(std.testing.allocator, cfg);
     try std.testing.expectEqual(Launcher.Mode.managed, launcher.mode);
@@ -552,6 +580,7 @@ test "healthCheck returns not alive for unbound port" {
         .mode = .managed,
         .extensions = null,
         .headless = true,
+        .proxy = null,
     };
     const status = launcher.healthCheck();
     try std.testing.expect(!status.alive);

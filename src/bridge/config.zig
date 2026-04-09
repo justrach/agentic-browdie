@@ -11,6 +11,7 @@ pub const Config = struct {
     navigate_timeout_ms: u32,
     extensions: ?[]const u8,
     headless: bool,
+    proxy: ?[]const u8,
 };
 
 pub fn load() Config {
@@ -25,6 +26,7 @@ pub fn load() Config {
         .navigate_timeout_ms = parseU32("NAVIGATE_TIMEOUT_MS") orelse 30_000,
         .extensions = getenvAny(&.{ "KURI_EXTENSIONS", "BROWDIE_EXTENSIONS" }),
         .headless = parseBool("HEADLESS") orelse true,
+        .proxy = getenvAny(&.{ "KURI_PROXY", "BROWDIE_PROXY" }),
     };
 }
 
