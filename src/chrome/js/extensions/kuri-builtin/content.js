@@ -60,6 +60,7 @@ window.__kuri = {
     version: '1.0.0',
     ready: true,
     _listeners: {},
+    _networkLog: [],
 
     on(event, fn) {
         if (!this._listeners[event]) this._listeners[event] = [];
@@ -81,5 +82,13 @@ window.__kuri = {
         };
     },
 };
+
+// Receive network log pushes from relay.js (ISOLATED world)
+window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    if (event.data?.type === 'kuri:networkLogPush' && Array.isArray(event.data.entries)) {
+        window.__kuri._networkLog.push(...event.data.entries);
+    }
+});
 
 window.dispatchEvent(new CustomEvent('kuri:ready', { detail: { version: '1.0.0' } }));

@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin_manifest = @embedFile("js/extensions/kuri-builtin/manifest.json");
 const builtin_content = @embedFile("js/extensions/kuri-builtin/content.js");
 const builtin_background = @embedFile("js/extensions/kuri-builtin/background.js");
+const builtin_relay = @embedFile("js/extensions/kuri-builtin/relay.js");
 
 const BuiltinFile = struct {
     name: []const u8,
@@ -14,6 +15,7 @@ const builtin_files = [_]BuiltinFile{
     .{ .name = "manifest.json", .data = builtin_manifest },
     .{ .name = "content.js", .data = builtin_content },
     .{ .name = "background.js", .data = builtin_background },
+    .{ .name = "relay.js", .data = builtin_relay },
 };
 
 /// Extract the builtin extension to disk and return its path.
