@@ -52,11 +52,11 @@ pub fn validateOutputPath(path: []const u8) ValidationError!void {
         }
     }
 
-    // Symlink check via lstat
+    // For existing files, check symlink via lstat (race-free for existing paths).
+    // Note: TOCTOU gap remains for files created between check and use.
+    // Callers should open with O_NOFOLLOW where the OS supports it.
     const stat = std.fs.cwd().statFile(path) catch |err| switch (err) {
-        // File doesn't exist yet — safe to create
         error.FileNotFound => return,
-        // Access denied or other OS errors — reject conservatively
         else => return ValidationError.InvalidPath,
     };
 
